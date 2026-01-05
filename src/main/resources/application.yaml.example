@@ -1,0 +1,27 @@
+spring:
+  ai:
+    openai:
+      # 配置方式 1：直接在此文件中填写（不推荐，会被提交到 Git）
+      # api-key: your-api-key-here
+      
+      # 配置方式 2：使用环境变量（推荐）
+      api-key: ${SPRING_AI_OPENAI_API_KEY:your-api-key-here}
+      
+      chat:
+        options:
+          model: gpt-5-nano
+          temperature: 0.7
+
+# 如果使用 DeepSeek，可以使用以下配置（需要自定义配置类）
+# spring:
+#   ai:
+#     deepseek:
+#       api-key: your-deepseek-api-key-here
+#       base-url: https://api.deepseek.com
+#       chat:
+#         options:
+#           model: deepseek-chat
+#           temperature: 0.7
+
+server:
+  port: 8080

@@ -1,0 +1,44 @@
+spring:
+  ai:
+    openai:
+      # API Key 配置说明：
+      # 1. 复制 application-secrets.yaml.example 为 application-secrets.yaml
+      # 2. 在 application-secrets.yaml 中填入您的真实 API key
+      # 3. application-secrets.yaml 已在 .gitignore 中，不会被提交到 Git
+      # 4. Spring Boot 会自动加载 application-secrets.yaml 并覆盖此处的配置
+      api-key: your-api-key-here  # 此值会被 application-secrets.yaml 覆盖
+      # OpenRouter 配置（通过 base-url 使用 OpenRouter）
+      # 注意：Spring AI 会自动添加 /v1 路径，所以这里只需要到 /api
+      base-url: https://openrouter.ai/api
+      chat:
+        options:
+          # OpenRouter 支持的模型，例如：
+          # openai/gpt-4, openai/gpt-3.5-turbo, anthropic/claude-3-opus, google/gemini-pro 等
+          # 查看所有可用模型：https://openrouter.ai/models
+          model: deepseek/deepseek-r1-0528:free
+          temperature: 0.7
+  config:
+    import: optional:classpath:application-secrets.yaml
+
+server:
+  port: 8080
+
+logging:
+  level:
+    # Spring AI 相关日志（只保留必要的信息）
+    org.springframework.ai: INFO
+    # WebClient 请求/响应日志（减少详细日志）
+    org.springframework.web.reactive.function.client: WARN
+    # Reactor Netty 网络层日志（关闭详细日志）
+    reactor.netty: WARN
+    reactor.netty.http.client: WARN
+    # HTTP 客户端详细日志（关闭）
+    org.springframework.web.reactive.function.client.ExchangeFunctions: WARN
+    # OpenAI 客户端日志（只保留必要信息）
+    org.springframework.ai.openai: INFO
+    # 应用日志（保留 INFO 级别）
+    com.example.ai: INFO
+    # 根日志级别
+    root: INFO
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
