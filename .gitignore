@@ -22,3 +22,26 @@
 # virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
 hs_err_pid*
 replay_pid*
+
+# Maven
+target/
+.mvn/
+mvnw
+mvnw.cmd
+
+# IDE
+.idea/
+.vscode/
+*.iml
+.classpath
+.project
+.settings/
+
+# Environment variables and sensitive config
+.env
+.env.local
+application-secrets.yaml
+application-local.yaml
+application-prod.yaml
+# 注意：所有包含敏感信息的配置文件都应添加到 .gitignore
+/src/main/frontend/generated/
