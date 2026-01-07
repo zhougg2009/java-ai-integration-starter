@@ -45,3 +45,4 @@ application-local.yaml
 application-prod.yaml
 # 注意：所有包含敏感信息的配置文件都应添加到 .gitignore
 /src/main/frontend/generated/
+/external-docs/vector-store.json

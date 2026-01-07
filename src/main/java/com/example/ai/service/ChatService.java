@@ -258,10 +258,30 @@ public class ChatService {
         log.info("========== 开始 RAG 增强请求 ==========");
         log.info("用户输入: {}", userMessage);
 
-        // 异步执行 RAG 检索，不阻塞 UI 线程
+        // 异步执行查询翻译和 RAG 检索，不阻塞 UI 线程
         Mono<List<DocumentService.SearchResult>> searchResultsMono = Mono.fromCallable(() -> {
-            log.info("开始执行文档检索...");
-            List<DocumentService.SearchResult> results = documentService.search(userMessage);
+            // 步骤 1: 语言对齐 - 如果需要，将查询翻译为英文
+            String searchQuery = userMessage;
+            if (!isEnglish(userMessage)) {
+                log.info("========== 语言对齐：检测到非英文查询 ==========");
+                log.info("原始查询（用户输入）: {}", userMessage);
+                log.info("开始翻译为英文搜索关键词...");
+                try {
+                    String englishQuery = translateToEnglishKeywords(userMessage);
+                    log.info("========== 翻译完成 ==========");
+                    log.info("Translated Search Query: {}", englishQuery);
+                    searchQuery = englishQuery;
+                } catch (Exception e) {
+                    log.warn("翻译失败，使用原始查询进行搜索: {}", e.getMessage());
+                    // 翻译失败时，继续使用原始查询
+                }
+            } else {
+                log.info("查询已经是英文，跳过翻译步骤（节省 API 成本）");
+            }
+            
+            // 步骤 2: 使用（可能翻译后的）查询执行文档检索
+            log.info("开始执行文档检索，搜索查询: {}", searchQuery);
+            List<DocumentService.SearchResult> results = documentService.search(searchQuery);
             log.info("检索完成，找到 {} 个相关切片", results.size());
             return results;
         }).subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic())
@@ -322,6 +342,77 @@ public class ChatService {
         return new RagResponse(responseStream, searchResultsMono);
     }
 
+    /**
+     * 检测文本是否主要是英文
+     * 简单启发式方法：如果文本中超过 50% 的字符是英文字母，则认为主要是英文
+     * 
+     * @param text 待检测的文本
+     * @return 如果主要是英文返回 true，否则返回 false
+     */
+    private boolean isEnglish(String text) {
+        if (text == null || text.trim().isEmpty()) {
+            return true; // 空文本默认为英文
+        }
+        
+        int totalChars = 0;
+        int englishChars = 0;
+        
+        for (char c : text.toCharArray()) {
+            if (Character.isLetter(c)) {
+                totalChars++;
+                if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+                    englishChars++;
+                }
+            }
+        }
+        
+        // 如果没有字母，默认为英文
+        if (totalChars == 0) {
+            return true;
+        }
+        
+        // 如果英文字母占比超过 50%，认为是英文
+        return (double) englishChars / totalChars > 0.5;
+    }
+    
+    /**
+     * 将中文技术问题翻译为英文搜索关键词
+     * 使用 AI 模型进行翻译，确保翻译结果适合用于技术文档搜索
+     * 
+     * @param chineseQuery 中文查询
+     * @return 英文搜索关键词
+     * @throws Exception 如果翻译失败
+     */
+    private String translateToEnglishKeywords(String chineseQuery) throws Exception {
+        String translationPrompt = String.format(
+            "Translate the following Chinese technical question into English search keywords for an English technical book. " +
+            "Return ONLY the translated English keywords, without any explanation or additional text: %s",
+            chineseQuery
+        );
+        
+        log.debug("翻译提示词: {}", translationPrompt);
+        
+        Prompt translationPromptObj = new Prompt(new UserMessage(translationPrompt));
+        ChatResponse response = chatModel.call(translationPromptObj);
+        
+        String translatedQuery = response.getResult().getOutput().getText();
+        
+        if (translatedQuery == null || translatedQuery.trim().isEmpty()) {
+            throw new RuntimeException("翻译结果为空");
+        }
+        
+        // 清理翻译结果（移除可能的引号、多余空格等）
+        translatedQuery = translatedQuery.trim();
+        if (translatedQuery.startsWith("\"") && translatedQuery.endsWith("\"")) {
+            translatedQuery = translatedQuery.substring(1, translatedQuery.length() - 1);
+        }
+        if (translatedQuery.startsWith("'") && translatedQuery.endsWith("'")) {
+            translatedQuery = translatedQuery.substring(1, translatedQuery.length() - 1);
+        }
+        
+        return translatedQuery.trim();
+    }
+    
     /**
      * 构建 System Prompt，包含检索到的参考资料
      * 
