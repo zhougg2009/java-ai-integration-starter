@@ -3,11 +3,10 @@ package com.example.ai.views;
 import com.example.ai.service.ChatService;
 import com.example.ai.service.DocumentService;
 import com.vaadin.flow.component.Component;
-import com.vaadin.flow.component.html.H2;
-import com.vaadin.flow.component.html.Paragraph;
+import com.vaadin.flow.component.details.Details;
+import com.vaadin.flow.component.details.DetailsVariant;
+import com.vaadin.flow.component.html.*;
 import com.vaadin.flow.component.messages.MessageInput;
-import com.vaadin.flow.component.messages.MessageList;
-import com.vaadin.flow.component.messages.MessageListItem;
 import com.vaadin.flow.component.orderedlayout.HorizontalLayout;
 import com.vaadin.flow.component.orderedlayout.VerticalLayout;
 import com.vaadin.flow.component.progressbar.ProgressBar;
@@ -18,11 +17,12 @@ import com.vaadin.flow.router.Route;
 import com.vaadin.flow.theme.lumo.LumoUtility;
 import dev.langchain4j.data.segment.TextSegment;
 import jakarta.annotation.PreDestroy;
+import org.commonmark.node.Node;
+import org.commonmark.parser.Parser;
+import org.commonmark.renderer.html.HtmlRenderer;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
-import java.time.Instant;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.ScheduledExecutorService;
@@ -38,15 +38,18 @@ import java.util.concurrent.TimeUnit;
 public class ChatView extends VerticalLayout {
 
     private final ChatService chatService;
-    private final MessageList messageList;
     private final MessageInput messageInput;
-    private final List<MessageListItem> messages;
+    private final VerticalLayout chatContainer;
+    private final Div chatScroller;
     private final AtomicReference<String> currentAiResponse;
-    private final AtomicReference<MessageListItem> currentAiMessageItem;
-    private final AtomicReference<Integer> currentAiMessageIndex;
+    private final AtomicReference<Component> currentAiMessageComponent;
     private final AtomicReference<Boolean> pendingUpdate;
     private final ScheduledExecutorService updateScheduler;
     private ProgressBar loadingIndicator;
+    
+    // Markdown 处理器
+    private final Parser markdownParser;
+    private final HtmlRenderer htmlRenderer;
     
     // 模式切换
     private Tabs modeTabs;
@@ -59,13 +62,15 @@ public class ChatView extends VerticalLayout {
 
     public ChatView(ChatService chatService) {
         this.chatService = chatService;
-        this.messages = new ArrayList<>();
         this.currentAiResponse = new AtomicReference<>("");
-        this.currentAiMessageItem = new AtomicReference<>();
-        this.currentAiMessageIndex = new AtomicReference<>(-1);
+        this.currentAiMessageComponent = new AtomicReference<>();
         this.pendingUpdate = new AtomicReference<>(false);
         this.updateScheduler = Executors.newSingleThreadScheduledExecutor();
         this.currentSearchResults = new AtomicReference<>(List.of());
+        
+        // 初始化 Markdown 处理器
+        this.markdownParser = Parser.builder().build();
+        this.htmlRenderer = HtmlRenderer.builder().build();
 
         setSizeFull();
         setPadding(false);
@@ -78,9 +83,20 @@ public class ChatView extends VerticalLayout {
         // 创建模式切换 Tabs
         Component modeSelector = createModeSelector();
         
-        // 创建消息列表
-        this.messageList = new MessageList();
-        messageList.setSizeFull();
+        // 创建聊天容器（使用 Div + VerticalLayout 实现滚动）
+        this.chatContainer = new VerticalLayout();
+        chatContainer.setWidthFull();
+        chatContainer.setPadding(true);
+        chatContainer.setSpacing(true);
+        chatContainer.addClassName("chat-container");
+        
+        // 创建滚动容器（使用 Div 配合 CSS）
+        this.chatScroller = new Div();
+        chatScroller.add(chatContainer);
+        chatScroller.setSizeFull();
+        chatScroller.getStyle().set("overflow-y", "auto");
+        chatScroller.getStyle().set("overflow-x", "hidden");
+        chatScroller.addClassName("chat-scroller");
 
         // 创建输入框
         this.messageInput = new MessageInput();
@@ -96,11 +112,11 @@ public class ChatView extends VerticalLayout {
         addWelcomeMessage();
 
         // 布局组件
-        VerticalLayout contentLayout = new VerticalLayout(messageList, loadingIndicator, messageInput);
+        VerticalLayout contentLayout = new VerticalLayout(chatScroller, loadingIndicator, messageInput);
         contentLayout.setSizeFull();
         contentLayout.setPadding(false);
         contentLayout.setSpacing(false);
-        contentLayout.setFlexGrow(1, messageList);
+        contentLayout.setFlexGrow(1, chatScroller);
 
         add(header, modeSelector, contentLayout);
         setFlexGrow(1, contentLayout);
@@ -167,14 +183,133 @@ public class ChatView extends VerticalLayout {
      * 添加欢迎消息
      */
     private void addWelcomeMessage() {
-        MessageListItem welcomeMessage = new MessageListItem(
-                "👋 你好！我是 AI 助手，有什么可以帮助你的吗？",
-                Instant.now(),
-                "AI Assistant"
-        );
-        welcomeMessage.addThemeNames("ai-message");
-        messages.add(welcomeMessage);
-        messageList.setItems(messages);
+        addMessage("👋 你好！我是 AI 助手，有什么可以帮助你的吗？", false, List.of());
+    }
+    
+    /**
+     * 添加消息到聊天容器
+     * 
+     * @param text 消息文本
+     * @param isUser 是否为用户消息
+     * @param sources 检索到的文档片段（仅用于 AI 消息）
+     */
+    private void addMessage(String text, boolean isUser, List<DocumentService.SearchResult> sources) {
+        VerticalLayout messageBubble = new VerticalLayout();
+        messageBubble.setPadding(true);
+        messageBubble.setSpacing(true);
+        messageBubble.setWidthFull();
+        messageBubble.addClassName("message-bubble");
+        
+        if (isUser) {
+            // 用户消息：蓝色背景，白色文字，右对齐
+            messageBubble.addClassName("user-message");
+            messageBubble.addClassName(LumoUtility.Background.PRIMARY);
+            messageBubble.addClassName(LumoUtility.TextColor.PRIMARY_CONTRAST);
+            messageBubble.addClassName(LumoUtility.BorderRadius.MEDIUM);
+            messageBubble.getStyle().set("align-self", "flex-end");
+            messageBubble.getStyle().set("max-width", "70%");
+            messageBubble.getStyle().set("margin-left", "auto");
+            
+            Span userText = new Span(text);
+            userText.addClassName(LumoUtility.FontSize.MEDIUM);
+            messageBubble.add(userText);
+        } else {
+            // AI 消息：浅灰色背景，左对齐
+            messageBubble.addClassName("ai-message");
+            messageBubble.addClassName(LumoUtility.Background.CONTRAST_5);
+            messageBubble.addClassName(LumoUtility.BorderRadius.MEDIUM);
+            messageBubble.getStyle().set("align-self", "flex-start");
+            messageBubble.getStyle().set("max-width", "80%");
+            messageBubble.getStyle().set("border-radius", "10px");
+            
+            // 将 Markdown 转换为 HTML
+            Node document = markdownParser.parse(text);
+            String html = htmlRenderer.render(document);
+            
+            // 创建 Div 组件并设置 innerHTML
+            Div htmlDiv = new Div();
+            htmlDiv.getElement().setProperty("innerHTML", "<div class='markdown-content'>" + html + "</div>");
+            htmlDiv.getStyle().set("width", "100%");
+            htmlDiv.addClassName("markdown-wrapper");
+            
+            // 添加 Markdown 样式（确保代码块使用等宽字体）
+            htmlDiv.getElement().executeJs(
+                "this.querySelectorAll('pre code, code').forEach(function(el) {" +
+                "  el.style.fontFamily = 'monospace';" +
+                "  el.style.fontSize = '0.9em';" +
+                "  el.style.backgroundColor = 'var(--lumo-contrast-10pct)';" +
+                "  el.style.padding = '2px 4px';" +
+                "  el.style.borderRadius = '3px';" +
+                "});" +
+                "this.querySelectorAll('pre').forEach(function(el) {" +
+                "  el.style.backgroundColor = 'var(--lumo-contrast-10pct)';" +
+                "  el.style.padding = '12px';" +
+                "  el.style.borderRadius = '4px';" +
+                "  el.style.overflowX = 'auto';" +
+                "});"
+            );
+            
+            messageBubble.add(htmlDiv);
+            
+            // 如果有检索结果，添加 Sources 部分
+            if (sources != null && !sources.isEmpty()) {
+                Details sourcesDetails = createSourcesDetails(sources);
+                messageBubble.add(sourcesDetails);
+            }
+        }
+        
+        chatContainer.add(messageBubble);
+        
+        // 滚动到底部
+        scrollToBottom();
+    }
+    
+    /**
+     * 创建 Sources 详情组件
+     * 
+     * @param sources 检索结果列表
+     * @return Details 组件
+     */
+    private Details createSourcesDetails(List<DocumentService.SearchResult> sources) {
+        Details details = new Details();
+        details.setSummaryText("Sources used (" + sources.size() + ")");
+        details.addThemeVariants(DetailsVariant.FILLED);
+        details.addClassName(LumoUtility.Margin.Top.SMALL);
+        
+        VerticalLayout sourcesContent = new VerticalLayout();
+        sourcesContent.setPadding(false);
+        sourcesContent.setSpacing(true);
+        
+        for (int i = 0; i < sources.size(); i++) {
+            DocumentService.SearchResult result = sources.get(i);
+            TextSegment segment = result.getSegment();
+            String text = segment.text();
+            
+            // 限制预览长度
+            String preview = text.length() > 200 ? text.substring(0, 200) + "..." : text;
+            
+            Div sourceItem = new Div();
+            sourceItem.addClassName(LumoUtility.Padding.SMALL);
+            sourceItem.addClassName(LumoUtility.Background.CONTRAST_10);
+            sourceItem.addClassName(LumoUtility.BorderRadius.SMALL);
+            
+            Span sourceNumber = new Span(String.format("%d. ", i + 1));
+            sourceNumber.addClassName(LumoUtility.FontWeight.BOLD);
+            
+            Span sourceText = new Span(preview);
+            sourceText.addClassName(LumoUtility.FontSize.SMALL);
+            
+            Span sourceScore = new Span(String.format(" (相似度: %.4f)", result.getScore()));
+            sourceScore.addClassName(LumoUtility.TextColor.SECONDARY);
+            sourceScore.addClassName(LumoUtility.FontSize.SMALL);
+            
+            sourceItem.add(sourceNumber, sourceText, sourceScore);
+            sourcesContent.add(sourceItem);
+        }
+        
+        // 使用 add 方法添加内容（Details 的新 API）
+        details.add(sourcesContent);
+        return details;
     }
 
     /**
@@ -191,28 +326,28 @@ public class ChatView extends VerticalLayout {
         loadingIndicator.setVisible(true);
 
         // 添加用户消息
-        MessageListItem userMessageItem = new MessageListItem(
-                userMessage,
-                Instant.now(),
-                "You"
-        );
-        userMessageItem.addThemeNames("user-message");
-        messages.add(userMessageItem);
-        messageList.setItems(messages);
+        addMessage(userMessage, true, List.of());
 
         // 创建 AI 消息占位符
-        MessageListItem aiMessageItem = new MessageListItem(
-                "正在思考...",
-                Instant.now(),
-                "AI Assistant"
-        );
-        aiMessageItem.addThemeNames("ai-message");
-        messages.add(aiMessageItem);
-        int aiMessageIndex = messages.size() - 1;
-        currentAiMessageItem.set(aiMessageItem);
-        currentAiMessageIndex.set(aiMessageIndex);
+        VerticalLayout aiMessagePlaceholder = new VerticalLayout();
+        aiMessagePlaceholder.setPadding(true);
+        aiMessagePlaceholder.addClassName("ai-message");
+        aiMessagePlaceholder.addClassName(LumoUtility.Background.CONTRAST_5);
+        aiMessagePlaceholder.addClassName(LumoUtility.BorderRadius.MEDIUM);
+        aiMessagePlaceholder.getStyle().set("align-self", "flex-start");
+        aiMessagePlaceholder.getStyle().set("max-width", "80%");
+        aiMessagePlaceholder.getStyle().set("border-radius", "10px");
+        
+        Span placeholderText = new Span("正在思考...");
+        placeholderText.addClassName(LumoUtility.TextColor.SECONDARY);
+        aiMessagePlaceholder.add(placeholderText);
+        
+        chatContainer.add(aiMessagePlaceholder);
+        currentAiMessageComponent.set(aiMessagePlaceholder);
         currentAiResponse.set("");
-        messageList.setItems(new ArrayList<>(messages));
+        
+        // 滚动到底部
+        scrollToBottom();
 
         // 根据模式选择不同的服务方法
         if (isBookAssistantMode) {
@@ -248,10 +383,6 @@ public class ChatView extends VerticalLayout {
         searchResultsMono.subscribe(
             results -> {
                 currentSearchResults.set(results);
-                // 在响应完成后显示 Sources
-                getUI().ifPresent(ui -> ui.access(() -> {
-                    // Sources 将在响应完成后显示
-                }));
             },
             error -> {
                 System.err.println("获取检索结果失败: " + error.getMessage());
@@ -287,10 +418,10 @@ public class ChatView extends VerticalLayout {
                 error -> {
                     // 处理错误
                     getUI().ifPresent(ui -> ui.access(() -> {
-                        MessageListItem currentItem = currentAiMessageItem.get();
-                        if (currentItem != null) {
-                            currentItem.setText("❌ 发生错误：" + error.getMessage());
-                            messageList.setItems(messages);
+                        Component currentComponent = currentAiMessageComponent.get();
+                        if (currentComponent != null) {
+                            chatContainer.remove(currentComponent);
+                            addMessage("❌ 发生错误：" + error.getMessage(), false, List.of());
                         }
                         loadingIndicator.setVisible(false);
                         messageInput.setEnabled(true);
@@ -309,7 +440,8 @@ public class ChatView extends VerticalLayout {
                         searchResultsMono.subscribe(
                             results -> {
                                 getUI().ifPresent(ui -> ui.access(() -> {
-                                    addSourcesToMessage(results);
+                                    // Sources 已经在 addMessage 中处理
+                                    updateAiMessageWithSources(results);
                                 }));
                             },
                             error -> {
@@ -328,51 +460,26 @@ public class ChatView extends VerticalLayout {
     }
     
     /**
-     * 在 AI 消息下方添加 Sources 信息
+     * 更新 AI 消息，添加 Sources 信息
      */
-    private void addSourcesToMessage(List<DocumentService.SearchResult> searchResults) {
-        if (searchResults == null || searchResults.isEmpty()) {
+    private void updateAiMessageWithSources(List<DocumentService.SearchResult> searchResults) {
+        Component currentComponent = currentAiMessageComponent.get();
+        if (currentComponent == null || searchResults == null || searchResults.isEmpty()) {
             return;
         }
         
-        Integer itemIndex = currentAiMessageIndex.get();
-        if (itemIndex < 0 || itemIndex >= messages.size()) {
-            return;
-        }
-        
-        // 构建 Sources 文本
-        StringBuilder sourcesText = new StringBuilder();
-        sourcesText.append("\n\n---\n");
-        sourcesText.append("**Sources used:**\n\n");
-        
-        for (int i = 0; i < searchResults.size(); i++) {
-            DocumentService.SearchResult result = searchResults.get(i);
-            TextSegment segment = result.getSegment();
-            String text = segment.text();
+        // 如果当前组件是 VerticalLayout，添加 Sources Details
+        if (currentComponent instanceof VerticalLayout) {
+            VerticalLayout messageLayout = (VerticalLayout) currentComponent;
+            // 检查是否已经添加了 Sources（避免重复添加）
+            boolean hasSources = messageLayout.getChildren()
+                    .anyMatch(child -> child instanceof Details);
             
-            // 限制预览长度
-            String preview = text.length() > 150 ? text.substring(0, 150) + "..." : text;
-            
-            sourcesText.append(String.format("%d. ", i + 1));
-            sourcesText.append(preview);
-            sourcesText.append(String.format(" (相似度: %.4f)", result.getScore()));
-            sourcesText.append("\n\n");
+            if (!hasSources) {
+                Details sourcesDetails = createSourcesDetails(searchResults);
+                messageLayout.add(sourcesDetails);
+            }
         }
-        
-        // 更新消息内容，添加 Sources
-        String currentText = currentAiResponse.get();
-        String textWithSources = currentText + sourcesText.toString();
-        
-        MessageListItem currentItem = currentAiMessageItem.get();
-        MessageListItem updatedItem = new MessageListItem(
-            textWithSources,
-            currentItem != null ? currentItem.getTime() : Instant.now(),
-            currentItem != null ? currentItem.getUserName() : "AI Assistant"
-        );
-        updatedItem.addThemeNames("ai-message");
-        messages.set(itemIndex, updatedItem);
-        currentAiMessageItem.set(updatedItem);
-        messageList.setItems(new ArrayList<>(messages));
     }
     
     /**
@@ -380,27 +487,67 @@ public class ChatView extends VerticalLayout {
      */
     private void updateMessageUI() {
         getUI().ifPresent(ui -> ui.access(() -> {
-            Integer itemIndex = currentAiMessageIndex.get();
+            Component currentComponent = currentAiMessageComponent.get();
             String currentText = currentAiResponse.get();
-            MessageListItem currentItem = currentAiMessageItem.get();
             
-            if (itemIndex >= 0 && itemIndex < messages.size() && currentText != null && !currentText.isEmpty()) {
-                // 直接更新现有 MessageListItem 的文本，而不是创建新对象
-                // 注意：MessageListItem 可能不支持直接 setText，所以我们需要替换
-                MessageListItem updatedItem = new MessageListItem(
-                        currentText,
-                        currentItem != null ? currentItem.getTime() : Instant.now(),
-                        currentItem != null ? currentItem.getUserName() : "AI Assistant"
-                );
-                updatedItem.addThemeNames("ai-message");
-                messages.set(itemIndex, updatedItem);
-                currentAiMessageItem.set(updatedItem);
-                
-                // 只在列表结构变化时才调用 setItems，这里直接更新单个项目
-                // 使用 refreshItem 如果支持，否则使用 setItems
-                messageList.setItems(new ArrayList<>(messages));
+            if (currentComponent != null && currentText != null && !currentText.isEmpty()) {
+                // 更新现有消息组件的内容
+                if (currentComponent instanceof VerticalLayout) {
+                    VerticalLayout messageLayout = (VerticalLayout) currentComponent;
+                    
+                    // 移除旧的文本组件（保留 Sources Details 如果存在）
+                    messageLayout.removeAll();
+                    
+                    // 将 Markdown 转换为 HTML
+                    Node document = markdownParser.parse(currentText);
+                    String html = htmlRenderer.render(document);
+                    
+                    // 创建 Div 组件并设置 innerHTML
+                    Div htmlDiv = new Div();
+                    htmlDiv.getElement().setProperty("innerHTML", "<div class='markdown-content'>" + html + "</div>");
+                    htmlDiv.getStyle().set("width", "100%");
+                    htmlDiv.addClassName("markdown-wrapper");
+                    
+                    // 添加 Markdown 样式
+                    htmlDiv.getElement().executeJs(
+                        "this.querySelectorAll('pre code, code').forEach(function(el) {" +
+                        "  el.style.fontFamily = 'monospace';" +
+                        "  el.style.fontSize = '0.9em';" +
+                        "  el.style.backgroundColor = 'var(--lumo-contrast-10pct)';" +
+                        "  el.style.padding = '2px 4px';" +
+                        "  el.style.borderRadius = '3px';" +
+                        "});" +
+                        "this.querySelectorAll('pre').forEach(function(el) {" +
+                        "  el.style.backgroundColor = 'var(--lumo-contrast-10pct)';" +
+                        "  el.style.padding = '12px';" +
+                        "  el.style.borderRadius = '4px';" +
+                        "  el.style.overflowX = 'auto';" +
+                        "});"
+                    );
+                    
+                    messageLayout.add(htmlDiv);
+                    
+                    // 如果有检索结果，添加 Sources
+                    List<DocumentService.SearchResult> sources = currentSearchResults.get();
+                    if (sources != null && !sources.isEmpty()) {
+                        Details sourcesDetails = createSourcesDetails(sources);
+                        messageLayout.add(sourcesDetails);
+                    }
+                    
+                    // 滚动到底部
+                    scrollToBottom();
+                }
             }
         }));
+    }
+    
+    /**
+     * 滚动到底部
+     */
+    private void scrollToBottom() {
+        chatScroller.getElement().executeJs(
+            "setTimeout(function() { this.scrollTop = this.scrollHeight; }, 100);"
+        );
     }
     
     /**

@@ -1,5 +1,8 @@
 package com.example.ai.service;
 
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.data.document.Document;
 import dev.langchain4j.data.document.loader.FileSystemDocumentLoader;
 import dev.langchain4j.data.document.parser.apache.pdfbox.ApachePdfBoxDocumentParser;
@@ -16,8 +19,11 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -30,20 +36,184 @@ public class DocumentService {
     private static final Logger log = LoggerFactory.getLogger(DocumentService.class);
     
     private static final String EXTERNAL_DOCS_DIR = "external-docs";
+    private static final String VECTOR_STORE_FILE = "vector-store.json";
     private static final int SEARCH_TOP_K = 3;
     
     private final EmbeddingModel embeddingModel;
     private final EmbeddingStore<TextSegment> vectorStore;
+    private final ObjectMapper objectMapper;
     
     private List<TextSegment> chunks;
     private String fileName;
     private boolean vectorStoreInitialized = false;
+    private Path vectorStorePath;
+    private List<Embedding> cachedEmbeddings; // 缓存 embeddings 以便保存
 
     public DocumentService() {
         // 初始化本地嵌入模型（不消耗 API 费用）
         this.embeddingModel = new AllMiniLmL6V2EmbeddingModel();
         this.vectorStore = new InMemoryEmbeddingStore<>();
+        this.objectMapper = new ObjectMapper();
+        
+        // 设置向量库文件路径
+        Path rootPath = Paths.get("").toAbsolutePath();
+        this.vectorStorePath = rootPath.resolve(EXTERNAL_DOCS_DIR).resolve(VECTOR_STORE_FILE);
+        
         log.info("已初始化 AllMiniLmL6V2EmbeddingModel 和 InMemoryEmbeddingStore");
+        log.info("向量库持久化路径: {}", vectorStorePath);
+        
+        // 尝试从文件加载向量库
+        initializeFromCacheOrCreate();
+    }
+
+    /**
+     * 初始化向量库：优先从缓存文件加载，如果不存在则创建新的
+     */
+    private void initializeFromCacheOrCreate() {
+        try {
+            File vectorStoreFile = vectorStorePath.toFile();
+            
+            if (vectorStoreFile.exists() && vectorStoreFile.isFile()) {
+                // 文件存在，尝试加载
+                log.info("发现向量库缓存文件，尝试加载...");
+                if (loadVectorStoreFromFile()) {
+                    log.info("已从本地文件加载向量库");
+                    vectorStoreInitialized = true;
+                    return;
+                } else {
+                    // 加载失败，删除损坏的文件
+                    log.warn("向量库文件损坏，将重新创建");
+                    try {
+                        Files.delete(vectorStorePath);
+                    } catch (IOException e) {
+                        log.warn("无法删除损坏的向量库文件: {}", e.getMessage());
+                    }
+                }
+            }
+            
+            // 文件不存在或加载失败，执行完整的加载和切分流程
+            log.info("向量库缓存文件不存在或已损坏，开始创建新的向量库...");
+            loadAndSplitDocument();
+            saveVectorStoreToFile();
+            log.info("已创建新的向量库并保存到本地文件");
+            
+        } catch (Exception e) {
+            log.error("初始化向量库时发生错误，将回退到重新处理 PDF", e);
+            // 发生错误时，尝试重新处理 PDF
+            try {
+                loadAndSplitDocument();
+                saveVectorStoreToFile();
+            } catch (Exception ex) {
+                log.error("重新处理 PDF 时也发生错误", ex);
+                throw new RuntimeException("向量库初始化失败: " + ex.getMessage(), ex);
+            }
+        }
+    }
+
+    /**
+     * 从文件加载向量库
+     * 
+     * @return 是否成功加载
+     */
+    private boolean loadVectorStoreFromFile() {
+        try {
+            File vectorStoreFile = vectorStorePath.toFile();
+            if (!vectorStoreFile.exists()) {
+                return false;
+            }
+            
+            // 读取 JSON 文件
+            VectorStoreData data = objectMapper.readValue(vectorStoreFile, VectorStoreData.class);
+            
+            // 验证数据完整性
+            if (data == null || data.getChunks() == null || data.getEmbeddings() == null) {
+                log.warn("向量库数据不完整");
+                return false;
+            }
+            
+            if (data.getChunks().size() != data.getEmbeddings().size()) {
+                log.warn("向量库数据不一致：chunks 数量 ({}) 与 embeddings 数量 ({}) 不匹配", 
+                        data.getChunks().size(), data.getEmbeddings().size());
+                return false;
+            }
+            
+            // 恢复 chunks 和 fileName
+            this.chunks = data.getChunks().stream()
+                    .map(chunkData -> TextSegment.from(chunkData.getText()))
+                    .collect(Collectors.toList());
+            this.fileName = data.getFileName();
+            
+            // 恢复向量库
+            for (int i = 0; i < data.getChunks().size(); i++) {
+                double[] embeddingArray = data.getEmbeddings().get(i);
+                // 将 double[] 转换为 List<Float>（Embedding 使用 List<Float>）
+                List<Float> embeddingList = new ArrayList<>();
+                for (double value : embeddingArray) {
+                    embeddingList.add((float) value);
+                }
+                Embedding embedding = Embedding.from(embeddingList);
+                TextSegment segment = chunks.get(i);
+                vectorStore.add(embedding, segment);
+            }
+            
+            log.info("成功加载向量库：{} 个切片，文件名: {}", chunks.size(), fileName);
+            return true;
+            
+        } catch (Exception e) {
+            log.error("从文件加载向量库时发生错误", e);
+            return false;
+        }
+    }
+
+    /**
+     * 保存向量库到文件
+     */
+    private void saveVectorStoreToFile() {
+        if (chunks == null || chunks.isEmpty() || !vectorStoreInitialized) {
+            log.warn("向量库未初始化或为空，跳过保存");
+            return;
+        }
+        
+        try {
+            // 确保目录存在
+            Files.createDirectories(vectorStorePath.getParent());
+            
+            // 收集所有 embeddings 和 chunks
+            List<double[]> embeddings = new ArrayList<>();
+            List<ChunkData> chunkDataList = new ArrayList<>();
+            
+            // 使用缓存的 embeddings（如果可用），否则重新计算
+            List<Embedding> embeddingsToSave = cachedEmbeddings != null && cachedEmbeddings.size() == chunks.size() 
+                    ? cachedEmbeddings 
+                    : chunks.stream()
+                            .map(segment -> embeddingModel.embed(segment.text()).content())
+                            .collect(Collectors.toList());
+            
+            for (int i = 0; i < chunks.size(); i++) {
+                Embedding embedding = embeddingsToSave.get(i);
+                // 将 float 列表转换为 double 数组
+                List<Float> floatList = embedding.vectorAsList();
+                double[] doubleArray = new double[floatList.size()];
+                for (int j = 0; j < floatList.size(); j++) {
+                    doubleArray[j] = floatList.get(j).doubleValue();
+                }
+                embeddings.add(doubleArray);
+                chunkDataList.add(new ChunkData(chunks.get(i).text()));
+            }
+            
+            // 创建数据对象
+            VectorStoreData data = new VectorStoreData(fileName, chunkDataList, embeddings);
+            
+            // 保存到文件
+            objectMapper.writerWithDefaultPrettyPrinter()
+                    .writeValue(vectorStorePath.toFile(), data);
+            
+            log.info("向量库已保存到文件: {}", vectorStorePath);
+            
+        } catch (Exception e) {
+            log.error("保存向量库到文件时发生错误", e);
+            // 不抛出异常，允许系统继续运行
+        }
     }
 
     /**
@@ -98,8 +268,10 @@ public class DocumentService {
             log.info("切片总数: {}", chunks.size());
             log.info("========== ========== ==========");
             
-            // 将切片存入向量库
-            initializeVectorStore();
+            // 将切片存入向量库（如果尚未初始化）
+            if (!vectorStoreInitialized) {
+                initializeVectorStore();
+            }
             
             return chunks;
             
@@ -127,10 +299,12 @@ public class DocumentService {
             log.info("开始初始化向量库，切片数量: {}", chunks.size());
             
             // 为每个切片生成嵌入向量并存储
+            cachedEmbeddings = new ArrayList<>();
             for (int i = 0; i < chunks.size(); i++) {
                 TextSegment segment = chunks.get(i);
                 Embedding embedding = embeddingModel.embed(segment.text()).content();
                 vectorStore.add(embedding, segment);
+                cachedEmbeddings.add(embedding); // 缓存 embedding 以便后续保存
                 
                 if ((i + 1) % 100 == 0) {
                     log.info("已处理 {}/{} 个切片", i + 1, chunks.size());
@@ -254,5 +428,52 @@ public class DocumentService {
             loadAndSplitDocument();
         }
         return chunks.size();
+    }
+
+    /**
+     * 向量库数据序列化类
+     */
+    private static class VectorStoreData {
+        private String fileName;
+        private List<ChunkData> chunks;
+        private List<double[]> embeddings;
+
+        @JsonCreator
+        public VectorStoreData(
+                @JsonProperty("fileName") String fileName,
+                @JsonProperty("chunks") List<ChunkData> chunks,
+                @JsonProperty("embeddings") List<double[]> embeddings) {
+            this.fileName = fileName;
+            this.chunks = chunks;
+            this.embeddings = embeddings;
+        }
+
+        public String getFileName() {
+            return fileName;
+        }
+
+        public List<ChunkData> getChunks() {
+            return chunks;
+        }
+
+        public List<double[]> getEmbeddings() {
+            return embeddings;
+        }
+    }
+
+    /**
+     * 切片数据序列化类
+     */
+    private static class ChunkData {
+        private String text;
+
+        @JsonCreator
+        public ChunkData(@JsonProperty("text") String text) {
+            this.text = text;
+        }
+
+        public String getText() {
+            return text;
+        }
     }
 }

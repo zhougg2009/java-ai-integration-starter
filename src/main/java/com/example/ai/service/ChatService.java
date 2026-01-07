@@ -75,6 +75,7 @@ public class ChatService {
 
     /**
      * 流式调用 AI 模型，返回响应流
+     * 使用 RAG 增强：在发起 AI 请求前，先检索相关文档片段
      * 
      * @param prompt 用户输入的提示词
      * @return AI 模型的响应流（Flux<String>）
@@ -85,23 +86,38 @@ public class ChatService {
             return Flux.error(new IllegalArgumentException("prompt 参数不能为空"));
         }
 
-        log.info("========== 开始 AI 请求 ==========");
+        log.info("========== 开始 RAG 增强的 AI 请求 ==========");
         log.info("用户输入: {}", prompt);
         
         try {
-            Prompt chatPrompt = new Prompt(new UserMessage(prompt));
-            log.info("已创建 Prompt，准备发送请求到 AI 模型");
+            // 在发起 AI 请求前，先检索相关文档片段
+            log.info("开始执行文档检索...");
+            List<DocumentService.SearchResult> searchResults = documentService.search(prompt);
+            log.info("检索完成，找到 {} 个相关切片", searchResults.size());
+            
+            // 构建增强的提示词
+            String augmentedPrompt = buildAugmentedPrompt(prompt, searchResults);
+            log.info("已构建增强提示词，长度: {} 字符", augmentedPrompt.length());
+            
+            // 创建包含 System Message 和 User Message 的 Prompt
+            Prompt chatPrompt = new Prompt(
+                List.of(
+                    new SystemMessage(buildSystemRole()),
+                    new UserMessage(augmentedPrompt)
+                )
+            );
+            log.info("已创建增强后的 Prompt，准备发送请求到 AI 模型");
             
             // 用于累积完整的响应内容
             AtomicReference<String> fullResponse = new AtomicReference<>("");
             
             return chatModel.stream(chatPrompt)
                     .doOnSubscribe(subscription -> {
-                        log.info("请求已发送，等待响应...");
+                        log.info("RAG 增强请求已发送，等待响应...");
                     })
                     .map(response -> {
                         String text = response.getResult().getOutput().getText();
-                        log.info("收到流式响应片段，长度: {}", text != null ? text.length() : 0);
+                        log.debug("收到流式响应片段，长度: {}", text != null ? text.length() : 0);
                         if (text != null && !text.isEmpty()) {
                             // 累积响应内容
                             String current = fullResponse.get();
@@ -113,16 +129,15 @@ public class ChatService {
                         return text != null ? text : "";
                     })
                     .doOnNext(chunk -> {
-                        log.info("流式响应 onNext 被调用，chunk 长度: {}", chunk != null ? chunk.length() : 0);
+                        log.debug("流式响应 onNext 被调用，chunk 长度: {}", chunk != null ? chunk.length() : 0);
                     })
                     .doOnComplete(() -> {
                         String completeResponse = fullResponse.get();
-                        log.info("========== AI 请求完成 ==========");
-                        log.info("完整响应内容: {}", completeResponse);
-                        log.info("响应长度: {} 字符", completeResponse.length());
+                        log.info("========== RAG 增强的 AI 请求完成 ==========");
+                        log.info("完整响应长度: {} 字符", completeResponse.length());
                     })
                     .onErrorResume(error -> {
-                        log.error("========== AI 请求失败 ==========");
+                        log.error("========== RAG 增强的 AI 请求失败 ==========");
                         log.error("错误类型: {}", error.getClass().getName());
                         log.error("错误消息: {}", error.getMessage());
                         
@@ -134,7 +149,7 @@ public class ChatService {
                         return Flux.error(new RuntimeException(userFriendlyMessage, error));
                     });
         } catch (Exception e) {
-            log.error("========== 创建请求时发生异常 ==========");
+            log.error("========== 创建 RAG 增强请求时发生异常 ==========");
             log.error("异常类型: {}", e.getClass().getName());
             log.error("异常消息: {}", e.getMessage());
             log.error("完整异常堆栈:", e);
@@ -142,6 +157,47 @@ public class ChatService {
             String userFriendlyMessage = getErrorMessage(e);
             return Flux.error(new RuntimeException(userFriendlyMessage, e));
         }
+    }
+    
+    /**
+     * 构建系统角色提示词
+     * 
+     * @return 系统角色提示词
+     */
+    private String buildSystemRole() {
+        return "You are an expert on 'Effective Java'. Use the following context to answer. If not in context, say so.";
+    }
+    
+    /**
+     * 构建增强的提示词（Augmented Prompt）
+     * 包含上下文（检索到的切片内容）和用户问题
+     * 
+     * @param originalPrompt 原始用户提示词
+     * @param searchResults 检索结果列表
+     * @return 增强后的提示词
+     */
+    private String buildAugmentedPrompt(String originalPrompt, List<DocumentService.SearchResult> searchResults) {
+        StringBuilder augmentedPrompt = new StringBuilder();
+        
+        // 添加上下文：参考以下书中片段
+        augmentedPrompt.append("Context:\n");
+        if (searchResults == null || searchResults.isEmpty()) {
+            augmentedPrompt.append("(No relevant context found)\n\n");
+        } else {
+            for (int i = 0; i < searchResults.size(); i++) {
+                DocumentService.SearchResult result = searchResults.get(i);
+                TextSegment segment = result.getSegment();
+                augmentedPrompt.append(String.format("[Chunk %d]\n", i + 1));
+                augmentedPrompt.append(segment.text());
+                augmentedPrompt.append("\n\n");
+            }
+        }
+        
+        // 添加用户问题
+        augmentedPrompt.append("User question: ");
+        augmentedPrompt.append(originalPrompt);
+        
+        return augmentedPrompt.toString();
     }
     
     /**
