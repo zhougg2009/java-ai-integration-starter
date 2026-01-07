@@ -64,6 +64,13 @@
             <artifactId>langchain4j-document-parser-apache-pdfbox</artifactId>
             <version>0.29.1</version>
         </dependency>
+
+        <!-- LangChain4j Embeddings (本地向量化) -->
+        <dependency>
+            <groupId>dev.langchain4j</groupId>
+            <artifactId>langchain4j-embeddings-all-minilm-l6-v2</artifactId>
+            <version>0.29.1</version>
+        </dependency>
     </dependencies>
 
     <build>
