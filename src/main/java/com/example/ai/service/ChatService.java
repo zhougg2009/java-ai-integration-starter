@@ -290,13 +290,27 @@ public class ChatService {
                 log.info("查询已经是英文，跳过翻译步骤（节省 API 成本）");
             }
             
-            // 步骤 2: 使用（可能翻译后的）查询执行文档检索（检索更多结果用于重排序）
-            int initialRetrievalSize = 20; // 初始检索 20 个 chunks
-            log.info("开始执行文档检索，搜索查询: {}，初始检索数量: {}", searchQuery, initialRetrievalSize);
-            List<DocumentService.SearchResult> initialResults = documentService.search(searchQuery, initialRetrievalSize);
+            // 步骤 2: 生成 HyDE (Hypothetical Document Embeddings) 假设答案
+            String hydeQuery = searchQuery;
+            try {
+                log.info("========== 开始生成 HyDE 假设答案 ==========");
+                log.info("原始查询: {}", searchQuery);
+                String hypotheticalAnswer = generateHyDEAnswer(searchQuery);
+                log.info("========== HyDE 假设答案生成完成 ==========");
+                log.info("HyDE Hypothetical Answer: {}", hypotheticalAnswer);
+                hydeQuery = hypotheticalAnswer;
+            } catch (Exception e) {
+                log.warn("HyDE 生成失败，使用原始查询进行搜索: {}", e.getMessage());
+                // HyDE 生成失败时，继续使用原始查询
+            }
+            
+            // 步骤 3: 使用 HyDE 假设答案执行文档检索（检索更多结果用于重排序）
+            int initialRetrievalSize = 15; // 初始检索 15 个 chunks（使用 HyDE 后可以减少检索数量）
+            log.info("开始执行文档检索，HyDE 查询: {}，初始检索数量: {}", hydeQuery, initialRetrievalSize);
+            List<DocumentService.SearchResult> initialResults = documentService.search(hydeQuery, initialRetrievalSize);
             log.info("初始检索完成，找到 {} 个相关切片", initialResults.size());
             
-            // 步骤 3: 重排序 - 使用本地评分模型对结果进行重新排序
+            // 步骤 4: 重排序 - 使用本地评分模型对结果进行重新排序
             log.info("开始执行重排序，从 {} 个结果中选择 TOP 5", initialResults.size());
             List<DocumentService.SearchResult> rerankedResults = rerankResults(initialResults, userMessage, 5);
             log.info("重排序完成，最终选择 {} 个最相关的切片", rerankedResults.size());
@@ -423,6 +437,46 @@ public class ChatService {
         
         // 如果英文字母占比超过 50%，认为是英文
         return (double) englishChars / totalChars > 0.5;
+    }
+    
+    /**
+     * 生成 HyDE (Hypothetical Document Embeddings) 假设答案
+     * 通过生成一个假设的答案来改善检索准确性，使查询更接近文档的语义空间
+     * 
+     * @param query 用户查询（已翻译为英文）
+     * @return 假设答案文本
+     * @throws Exception 如果生成失败
+     */
+    private String generateHyDEAnswer(String query) throws Exception {
+        String hydePrompt = String.format(
+            "Please write a brief, technical answer to the following question as if it were an excerpt from a professional Java book like 'Effective Java'. " +
+            "The answer should be concise (2-3 sentences), technical, and written in the style of a programming book. " +
+            "Do not include the question itself, only provide the answer. " +
+            "Question: %s",
+            query
+        );
+        
+        log.debug("HyDE 提示词: {}", hydePrompt);
+        
+        Prompt hydePromptObj = new Prompt(new UserMessage(hydePrompt));
+        ChatResponse response = chatModel.call(hydePromptObj);
+        
+        String hypotheticalAnswer = response.getResult().getOutput().getText();
+        
+        if (hypotheticalAnswer == null || hypotheticalAnswer.trim().isEmpty()) {
+            throw new RuntimeException("HyDE 假设答案生成结果为空");
+        }
+        
+        // 清理结果（移除可能的引号、多余空格等）
+        hypotheticalAnswer = hypotheticalAnswer.trim();
+        if (hypotheticalAnswer.startsWith("\"") && hypotheticalAnswer.endsWith("\"")) {
+            hypotheticalAnswer = hypotheticalAnswer.substring(1, hypotheticalAnswer.length() - 1);
+        }
+        if (hypotheticalAnswer.startsWith("'") && hypotheticalAnswer.endsWith("'")) {
+            hypotheticalAnswer = hypotheticalAnswer.substring(1, hypotheticalAnswer.length() - 1);
+        }
+        
+        return hypotheticalAnswer.trim();
     }
     
     /**
