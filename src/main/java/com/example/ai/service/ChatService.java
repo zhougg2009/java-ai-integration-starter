@@ -5,6 +5,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.model.ChatResponse;
+import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.prompt.Prompt;
@@ -13,6 +15,9 @@ import org.springframework.web.reactive.function.client.WebClientResponseExcepti
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -24,13 +29,19 @@ import java.util.concurrent.atomic.AtomicReference;
 public class ChatService {
 
     private static final Logger log = LoggerFactory.getLogger(ChatService.class);
+    private static final int MEMORY_CAPACITY = 10;
     
     private final ChatModel chatModel;
     private final DocumentService documentService;
+    private final List<Message> chatMemory;
+    private final Object memoryLock = new Object();
 
     public ChatService(ChatModel chatModel, DocumentService documentService) {
         this.chatModel = chatModel;
         this.documentService = documentService;
+        // 初始化对话记忆，使用线程安全的 LinkedList，容量设为 10 条消息
+        this.chatMemory = Collections.synchronizedList(new LinkedList<>());
+        log.info("已初始化对话记忆，容量: {} 条消息", MEMORY_CAPACITY);
     }
 
     /**
@@ -279,11 +290,18 @@ public class ChatService {
                 log.info("查询已经是英文，跳过翻译步骤（节省 API 成本）");
             }
             
-            // 步骤 2: 使用（可能翻译后的）查询执行文档检索
-            log.info("开始执行文档检索，搜索查询: {}", searchQuery);
-            List<DocumentService.SearchResult> results = documentService.search(searchQuery);
-            log.info("检索完成，找到 {} 个相关切片", results.size());
-            return results;
+            // 步骤 2: 使用（可能翻译后的）查询执行文档检索（检索更多结果用于重排序）
+            int initialRetrievalSize = 20; // 初始检索 20 个 chunks
+            log.info("开始执行文档检索，搜索查询: {}，初始检索数量: {}", searchQuery, initialRetrievalSize);
+            List<DocumentService.SearchResult> initialResults = documentService.search(searchQuery, initialRetrievalSize);
+            log.info("初始检索完成，找到 {} 个相关切片", initialResults.size());
+            
+            // 步骤 3: 重排序 - 使用本地评分模型对结果进行重新排序
+            log.info("开始执行重排序，从 {} 个结果中选择 TOP 5", initialResults.size());
+            List<DocumentService.SearchResult> rerankedResults = rerankResults(initialResults, userMessage, 5);
+            log.info("重排序完成，最终选择 {} 个最相关的切片", rerankedResults.size());
+            
+            return rerankedResults;
         }).subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic())
           .doOnError(error -> {
               log.error("文档检索失败", error);
@@ -296,15 +314,31 @@ public class ChatService {
             String systemPrompt = buildSystemPrompt(searchResults);
             log.info("构建的 System Prompt 长度: {} 字符", systemPrompt.length());
 
-            // 创建包含 System Message 和 User Message 的 Prompt
-            Prompt enhancedPrompt = new Prompt(
-                List.of(
-                    new SystemMessage(systemPrompt),
-                    new UserMessage(userMessage)
-                )
-            );
+            // 获取对话历史（线程安全）
+            List<Message> conversationHistory;
+            synchronized (memoryLock) {
+                conversationHistory = new ArrayList<>(chatMemory);
+            }
+            log.info("对话历史消息数: {}", conversationHistory.size());
 
-            log.info("已创建增强后的 Prompt，准备发送请求到 AI 模型");
+            // 构建完整的消息列表：System Message + 对话历史 + 当前用户消息
+            List<Message> messages = new ArrayList<>();
+            messages.add(new SystemMessage(systemPrompt));
+            
+            // 添加对话历史（排除 SystemMessage，只保留 UserMessage 和 AssistantMessage）
+            for (Message historyMessage : conversationHistory) {
+                if (!(historyMessage instanceof SystemMessage)) {
+                    messages.add(historyMessage);
+                }
+            }
+            
+            // 添加当前用户消息
+            messages.add(new UserMessage(userMessage));
+
+            // 创建包含对话历史的 Prompt
+            Prompt enhancedPrompt = new Prompt(messages);
+
+            log.info("已创建增强后的 Prompt（包含 {} 条历史消息），准备发送请求到 AI 模型", conversationHistory.size());
 
             // 用于累积完整的响应内容
             AtomicReference<String> fullResponse = new AtomicReference<>("");
@@ -326,6 +360,22 @@ public class ChatService {
                         String completeResponse = fullResponse.get();
                         log.info("========== RAG 请求完成 ==========");
                         log.info("完整响应长度: {} 字符", completeResponse.length());
+                        
+                        // 将用户问题和 AI 回答存入记忆（线程安全）
+                        try {
+                            synchronized (memoryLock) {
+                                chatMemory.add(new UserMessage(userMessage));
+                                chatMemory.add(new AssistantMessage(completeResponse));
+                                
+                                // 如果超过容量，移除最旧的消息（保持容量为 10 条）
+                                while (chatMemory.size() > MEMORY_CAPACITY) {
+                                    chatMemory.remove(0);
+                                }
+                            }
+                            log.info("已将用户问题和 AI 回答存入对话记忆，当前记忆大小: {}", chatMemory.size());
+                        } catch (Exception e) {
+                            log.warn("保存对话记忆失败: {}", e.getMessage());
+                        }
                     })
                     .onErrorResume(error -> {
                         log.error("========== RAG 请求失败 ==========");
@@ -439,6 +489,217 @@ public class ChatService {
         }
 
         return promptBuilder.toString();
+    }
+
+    /**
+     * 重排序搜索结果
+     * 使用本地评分模型对检索结果进行重新排序，选择最相关的 TOP K 个结果
+     * 
+     * @param initialResults 初始检索结果
+     * @param userQuery 用户原始查询（用于评分）
+     * @param topK 最终返回的结果数量
+     * @return 重排序后的 TOP K 个结果
+     */
+    private List<DocumentService.SearchResult> rerankResults(
+            List<DocumentService.SearchResult> initialResults, 
+            String userQuery, 
+            int topK) {
+        
+        if (initialResults == null || initialResults.isEmpty()) {
+            return List.of();
+        }
+        
+        if (initialResults.size() <= topK) {
+            // 如果初始结果数量已经小于等于 topK，直接返回
+            log.info("初始结果数量 ({}) 已小于等于目标数量 ({})，跳过重排序", initialResults.size(), topK);
+            return initialResults;
+        }
+        
+        log.info("开始重排序 {} 个结果，目标选择 TOP {}", initialResults.size(), topK);
+        
+        // 使用本地评分模型对每个结果进行评分
+        List<ScoredResult> scoredResults = initialResults.stream()
+                .map(result -> {
+                    double rerankScore = calculateRerankScore(result, userQuery);
+                    return new ScoredResult(result, rerankScore);
+                })
+                .sorted((a, b) -> Double.compare(b.rerankScore, a.rerankScore)) // 降序排序
+                .limit(topK)
+                .collect(java.util.stream.Collectors.toList());
+        
+        if (!scoredResults.isEmpty()) {
+            double minScore = scoredResults.get(scoredResults.size() - 1).rerankScore;
+            double maxScore = scoredResults.get(0).rerankScore;
+            log.info("重排序完成，TOP {} 个结果的得分范围: {:.4f} - {:.4f}", 
+                    topK, String.format("%.4f", minScore), String.format("%.4f", maxScore));
+        } else {
+            log.info("重排序完成，但未找到任何结果");
+        }
+        
+        return scoredResults.stream()
+                .map(sr -> sr.result)
+                .collect(java.util.stream.Collectors.toList());
+    }
+    
+    /**
+     * 计算重排序得分
+     * 结合向量相似度得分和文本相关性得分
+     * 
+     * @param result 搜索结果
+     * @param userQuery 用户查询
+     * @return 重排序得分（0.0 - 1.0）
+     */
+    private double calculateRerankScore(DocumentService.SearchResult result, String userQuery) {
+        String text = result.getSegment().text().toLowerCase();
+        String query = userQuery.toLowerCase();
+        
+        // 1. 向量相似度得分（归一化到 0-1，权重 0.4）
+        double vectorScore = Math.max(0.0, Math.min(1.0, result.getScore()));
+        double weightedVectorScore = vectorScore * 0.4;
+        
+        // 2. 关键词匹配得分（权重 0.3）
+        double keywordScore = calculateKeywordMatchScore(text, query);
+        double weightedKeywordScore = keywordScore * 0.3;
+        
+        // 3. 文本长度得分（偏好中等长度的文本，权重 0.1）
+        double lengthScore = calculateLengthScore(text);
+        double weightedLengthScore = lengthScore * 0.1;
+        
+        // 4. 查询词密度得分（查询词在文本中的出现频率，权重 0.2）
+        double densityScore = calculateQueryDensityScore(text, query);
+        double weightedDensityScore = densityScore * 0.2;
+        
+        // 综合得分
+        double finalScore = weightedVectorScore + weightedKeywordScore + weightedLengthScore + weightedDensityScore;
+        
+        return Math.max(0.0, Math.min(1.0, finalScore));
+    }
+    
+    /**
+     * 计算关键词匹配得分
+     * 检查查询中的关键词是否出现在文本中
+     */
+    private double calculateKeywordMatchScore(String text, String query) {
+        if (text == null || query == null || text.isEmpty() || query.isEmpty()) {
+            return 0.0;
+        }
+        
+        // 提取查询中的关键词（去除常见停用词）
+        String[] stopWords = {"the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by", "is", "are", "was", "were", "be", "been", "have", "has", "had", "do", "does", "did", "will", "would", "should", "could", "may", "might", "can", "this", "that", "these", "those", "what", "which", "who", "where", "when", "why", "how"};
+        java.util.Set<String> stopWordSet = java.util.Set.of(stopWords);
+        
+        String[] queryWords = query.split("\\s+");
+        int matchedWords = 0;
+        int totalWords = 0;
+        
+        for (String word : queryWords) {
+            word = word.replaceAll("[^a-zA-Z0-9]", "").toLowerCase();
+            if (!word.isEmpty() && !stopWordSet.contains(word)) {
+                totalWords++;
+                if (text.contains(word)) {
+                    matchedWords++;
+                }
+            }
+        }
+        
+        return totalWords > 0 ? (double) matchedWords / totalWords : 0.0;
+    }
+    
+    /**
+     * 计算文本长度得分
+     * 偏好中等长度的文本（100-500 字符）
+     */
+    private double calculateLengthScore(String text) {
+        if (text == null) {
+            return 0.0;
+        }
+        
+        int length = text.length();
+        int optimalMin = 100;
+        int optimalMax = 500;
+        
+        if (length < optimalMin) {
+            // 太短的文本得分较低
+            return (double) length / optimalMin * 0.5;
+        } else if (length <= optimalMax) {
+            // 中等长度的文本得分最高
+            return 1.0;
+        } else {
+            // 太长的文本得分逐渐降低
+            double excess = length - optimalMax;
+            double penalty = Math.min(0.5, excess / optimalMax);
+            return 1.0 - penalty;
+        }
+    }
+    
+    /**
+     * 计算查询词密度得分
+     * 查询词在文本中的出现频率
+     */
+    private double calculateQueryDensityScore(String text, String query) {
+        if (text == null || query == null || text.isEmpty() || query.isEmpty()) {
+            return 0.0;
+        }
+        
+        String[] queryWords = query.toLowerCase().split("\\s+");
+        int totalOccurrences = 0;
+        int totalWords = 0;
+        
+        for (String word : queryWords) {
+            word = word.replaceAll("[^a-zA-Z0-9]", "").toLowerCase();
+            if (!word.isEmpty()) {
+                totalWords++;
+                // 计算单词在文本中的出现次数
+                int count = (text.length() - text.replace(word, "").length()) / word.length();
+                totalOccurrences += count;
+            }
+        }
+        
+        if (totalWords == 0 || text.length() == 0) {
+            return 0.0;
+        }
+        
+        // 归一化：出现次数 / (文本长度 / 平均单词长度)
+        double avgWordLength = 5.0; // 假设平均单词长度为 5
+        double normalizedDensity = (double) totalOccurrences / (text.length() / avgWordLength);
+        
+        // 使用 sigmoid 函数将密度映射到 0-1
+        return Math.min(1.0, normalizedDensity / 2.0);
+    }
+    
+    /**
+     * 带重排序得分的搜索结果包装类
+     */
+    private static class ScoredResult {
+        final DocumentService.SearchResult result;
+        final double rerankScore;
+        
+        ScoredResult(DocumentService.SearchResult result, double rerankScore) {
+            this.result = result;
+            this.rerankScore = rerankScore;
+        }
+    }
+    
+    /**
+     * 清理对话记忆
+     * 在切换 Tab（从通用聊天到书本助手）时调用
+     */
+    public void clearMemory() {
+        synchronized (memoryLock) {
+            chatMemory.clear();
+        }
+        log.info("已清理对话记忆");
+    }
+    
+    /**
+     * 获取当前对话记忆的消息数量
+     * 
+     * @return 消息数量
+     */
+    public int getMemorySize() {
+        synchronized (memoryLock) {
+            return chatMemory.size();
+        }
     }
 
     /**

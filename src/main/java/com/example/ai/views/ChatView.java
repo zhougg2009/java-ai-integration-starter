@@ -139,7 +139,16 @@ public class ChatView extends VerticalLayout {
         modeTabs = new Tabs(generalChatTab, bookAssistantTab);
         modeTabs.setSelectedTab(generalChatTab);
         modeTabs.addSelectedChangeListener(e -> {
+            boolean previousMode = isBookAssistantMode;
             isBookAssistantMode = e.getSelectedTab() == bookAssistantTab;
+            
+            // 如果从通用聊天切换到书本助手，清理对话记忆
+            // 如果从书本助手切换到通用聊天，也清理记忆（确保每个模式有独立的对话上下文）
+            if (previousMode != isBookAssistantMode) {
+                chatService.clearMemory();
+                System.out.println("模式切换: " + (isBookAssistantMode ? "Book Assistant" : "General Chat") + " - 已清理对话记忆");
+            }
+            
             logModeChange();
         });
         

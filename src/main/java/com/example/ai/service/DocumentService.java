@@ -37,7 +37,7 @@ public class DocumentService {
     
     private static final String EXTERNAL_DOCS_DIR = "external-docs";
     private static final String VECTOR_STORE_FILE = "vector-store.json";
-    private static final int SEARCH_TOP_K = 3;
+    private static final int SEARCH_TOP_K = 3; // 默认返回数量（用于向后兼容）
     
     private final EmbeddingModel embeddingModel;
     private final EmbeddingStore<TextSegment> vectorStore;
@@ -328,7 +328,24 @@ public class DocumentService {
      * @param query 搜索查询
      * @return 包含相似度得分的切片列表（最多 3 个）
      */
+    /**
+     * 执行语义搜索，返回最相关的切片（默认返回 3 个）
+     * 
+     * @param query 搜索查询
+     * @return 搜索结果列表，按相似度得分降序排列
+     */
     public List<SearchResult> search(String query) {
+        return search(query, SEARCH_TOP_K);
+    }
+    
+    /**
+     * 执行语义搜索，返回指定数量的最相关切片
+     * 
+     * @param query 搜索查询
+     * @param topK 返回的切片数量
+     * @return 搜索结果列表，按相似度得分降序排列
+     */
+    public List<SearchResult> search(String query, int topK) {
         if (query == null || query.trim().isEmpty()) {
             log.warn("搜索查询为空");
             return List.of();
@@ -344,7 +361,7 @@ public class DocumentService {
         }
         
         try {
-            log.info("执行语义搜索，查询: {}", query);
+            log.info("执行语义搜索，查询: {}，返回数量: {}", query, topK);
             
             // 为查询生成嵌入向量
             Embedding queryEmbedding = embeddingModel.embed(query).content();
@@ -352,7 +369,7 @@ public class DocumentService {
             // 在向量库中搜索最相关的切片
             List<EmbeddingMatch<TextSegment>> matches = vectorStore.findRelevant(
                     queryEmbedding, 
-                    SEARCH_TOP_K
+                    topK
             );
             
             log.info("找到 {} 个相关结果", matches.size());
