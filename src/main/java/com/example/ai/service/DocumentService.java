@@ -24,7 +24,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 /**
@@ -43,11 +45,17 @@ public class DocumentService {
     private final EmbeddingStore<TextSegment> vectorStore;
     private final ObjectMapper objectMapper;
     
-    private List<TextSegment> chunks;
+    private List<TextSegment> chunks; // 保留用于向后兼容
+    private List<TextSegment> childSegments; // 子片段（用于向量搜索）
+    private Map<String, TextSegment> parentSegments; // 父片段映射 (parentId -> parent segment)
     private String fileName;
     private boolean vectorStoreInitialized = false;
     private Path vectorStorePath;
     private List<Embedding> cachedEmbeddings; // 缓存 embeddings 以便保存
+    
+    // Parent-Child 配置
+    private static final int PARENT_SEGMENT_SIZE = 800; // 父片段大小（字符）
+    private static final int CHILD_SEGMENT_SIZE = 150; // 子片段大小（字符）
 
     public DocumentService() {
         // 初始化本地嵌入模型（不消耗 API 费用）
@@ -137,14 +145,37 @@ public class DocumentService {
                 return false;
             }
             
-            // 恢复 chunks 和 fileName
-            this.chunks = data.getChunks().stream()
+            // 恢复子片段和父片段（注意：旧版本可能没有 parent-child 结构，需要兼容处理）
+            this.childSegments = data.getChunks().stream()
                     .map(chunkData -> TextSegment.from(chunkData.getText()))
                     .collect(Collectors.toList());
             this.fileName = data.getFileName();
             
-            // 恢复向量库
-            for (int i = 0; i < data.getChunks().size(); i++) {
+            // 尝试从子片段重建父片段（如果元数据存在）
+            this.parentSegments = new HashMap<>();
+            for (TextSegment child : childSegments) {
+                if (child.metadata() != null && child.metadata().containsKey("parentId")) {
+                    String parentId = child.metadata().get("parentId");
+                    // 如果父片段还不存在，创建一个（从子片段推断）
+                    if (!parentSegments.containsKey(parentId)) {
+                        // 注意：从文件加载时，我们无法完全恢复父片段
+                        // 这里使用子片段作为占位符，实际使用时会通过其他方式获取
+                        parentSegments.put(parentId, child);
+                    }
+                }
+            }
+            
+            // 如果没有父片段，说明是旧版本数据，需要重新处理
+            if (parentSegments.isEmpty()) {
+                log.warn("检测到旧版本向量库数据（无 Parent-Child 结构），建议重新处理 PDF");
+                // 为了兼容，将子片段也作为父片段
+                for (int i = 0; i < childSegments.size(); i++) {
+                    parentSegments.put("parent_" + i, childSegments.get(i));
+                }
+            }
+            
+            // 恢复向量库（只存储子片段）
+            for (int i = 0; i < childSegments.size(); i++) {
                 double[] embeddingArray = data.getEmbeddings().get(i);
                 // 将 double[] 转换为 List<Float>（Embedding 使用 List<Float>）
                 List<Float> embeddingList = new ArrayList<>();
@@ -152,11 +183,15 @@ public class DocumentService {
                     embeddingList.add((float) value);
                 }
                 Embedding embedding = Embedding.from(embeddingList);
-                TextSegment segment = chunks.get(i);
+                TextSegment segment = childSegments.get(i);
                 vectorStore.add(embedding, segment);
             }
             
-            log.info("成功加载向量库：{} 个切片，文件名: {}", chunks.size(), fileName);
+            // 为了向后兼容，保留 chunks
+            this.chunks = new ArrayList<>(childSegments);
+            
+            log.info("成功加载向量库：{} 个子片段，{} 个父片段，文件名: {}", 
+                    childSegments.size(), parentSegments.size(), fileName);
             return true;
             
         } catch (Exception e) {
@@ -169,7 +204,7 @@ public class DocumentService {
      * 保存向量库到文件
      */
     private void saveVectorStoreToFile() {
-        if (chunks == null || chunks.isEmpty() || !vectorStoreInitialized) {
+        if (childSegments == null || childSegments.isEmpty() || !vectorStoreInitialized) {
             log.warn("向量库未初始化或为空，跳过保存");
             return;
         }
@@ -178,18 +213,18 @@ public class DocumentService {
             // 确保目录存在
             Files.createDirectories(vectorStorePath.getParent());
             
-            // 收集所有 embeddings 和 chunks
+            // 收集所有 embeddings 和 child segments（只保存子片段用于向量搜索）
             List<double[]> embeddings = new ArrayList<>();
             List<ChunkData> chunkDataList = new ArrayList<>();
             
             // 使用缓存的 embeddings（如果可用），否则重新计算
-            List<Embedding> embeddingsToSave = cachedEmbeddings != null && cachedEmbeddings.size() == chunks.size() 
+            List<Embedding> embeddingsToSave = cachedEmbeddings != null && cachedEmbeddings.size() == childSegments.size() 
                     ? cachedEmbeddings 
-                    : chunks.stream()
+                    : childSegments.stream()
                             .map(segment -> embeddingModel.embed(segment.text()).content())
                             .collect(Collectors.toList());
             
-            for (int i = 0; i < chunks.size(); i++) {
+            for (int i = 0; i < childSegments.size(); i++) {
                 Embedding embedding = embeddingsToSave.get(i);
                 // 将 float 列表转换为 double 数组
                 List<Float> floatList = embedding.vectorAsList();
@@ -198,7 +233,17 @@ public class DocumentService {
                     doubleArray[j] = floatList.get(j).doubleValue();
                 }
                 embeddings.add(doubleArray);
-                chunkDataList.add(new ChunkData(chunks.get(i).text()));
+                
+                // 保存子片段文本和元数据（包含 parentId）
+                TextSegment childSegment = childSegments.get(i);
+                String childText = childSegment.text();
+                // 如果元数据中有 parentId，将其附加到文本中（用于恢复）
+                if (childSegment.metadata() != null && childSegment.metadata().containsKey("parentId")) {
+                    String parentId = childSegment.metadata().get("parentId");
+                    // 使用特殊标记保存元数据信息
+                    childText = "<!--PARENT_ID:" + parentId + "--> " + childText;
+                }
+                chunkDataList.add(new ChunkData(childText));
             }
             
             // 创建数据对象
@@ -259,16 +304,19 @@ public class DocumentService {
             
             log.info("文档加载成功，内容长度: {} 字符", document.text().length());
             
-            // 使用 DocumentByParagraphSplitter 按段落进行切分
-            // 注意：如果 DocumentByParagraphSplitter 不可用，使用 DocumentSplitters 作为替代
-            // 理想情况下应使用: new DocumentByParagraphSplitter().split(document)
-            this.chunks = DocumentSplitters.recursive(300, 30).split(document);
+            // 使用 Parent-Child 策略进行切分
+            log.info("开始使用 Parent-Child 策略切分文档...");
+            createParentChildSegments(document);
             
             log.info("========== 文档切分完成 ==========");
-            log.info("切片总数: {}", chunks.size());
+            log.info("父片段总数: {}", parentSegments.size());
+            log.info("子片段总数: {}", childSegments.size());
             log.info("========== ========== ==========");
             
-            // 将切片存入向量库（如果尚未初始化）
+            // 为了向后兼容，保留 chunks（使用 child segments）
+            this.chunks = new ArrayList<>(childSegments);
+            
+            // 将子片段存入向量库（如果尚未初始化）
             if (!vectorStoreInitialized) {
                 initializeVectorStore();
             }
@@ -282,7 +330,87 @@ public class DocumentService {
     }
 
     /**
-     * 初始化向量库，将所有切片进行向量化并存储
+     * 创建 Parent-Child 片段结构
+     * - Parent segments: 大片段（800 字符）包含完整上下文
+     * - Child segments: 小片段（150 字符）用于高精度向量搜索
+     * 
+     * @param document 原始文档
+     */
+    private void createParentChildSegments(Document document) {
+        this.childSegments = new ArrayList<>();
+        this.parentSegments = new HashMap<>();
+        
+        log.info("开始创建 Parent-Child 片段结构...");
+        log.info("父片段大小: {} 字符，子片段大小: {} 字符", PARENT_SEGMENT_SIZE, CHILD_SEGMENT_SIZE);
+        
+        // 首先创建父片段（大片段）
+        List<TextSegment> tempParentSegments = DocumentSplitters.recursive(PARENT_SEGMENT_SIZE, 50).split(document);
+        
+        int parentIndex = 0;
+        for (TextSegment parentSegment : tempParentSegments) {
+            String parentId = "parent_" + parentIndex;
+            String parentText = parentSegment.text();
+            
+            // 存储父片段
+            parentSegments.put(parentId, parentSegment);
+            
+            // 从父片段中创建子片段（小片段，用于向量搜索）
+            int parentLength = parentText.length();
+            int childIndex = 0;
+            
+            // 使用滑动窗口创建子片段（有重叠以确保覆盖）
+            int overlap = 30; // 子片段之间的重叠
+            int start = 0;
+            
+            while (start < parentLength) {
+                int end = Math.min(start + CHILD_SEGMENT_SIZE, parentLength);
+                String childText = parentText.substring(start, end);
+                
+                // 创建子片段，并在元数据中存储父片段 ID
+                TextSegment childSegment = TextSegment.from(childText);
+                childSegment.metadata().put("parentId", parentId);
+                childSegment.metadata().put("parentIndex", String.valueOf(parentIndex));
+                childSegment.metadata().put("childIndex", String.valueOf(childIndex));
+                
+                childSegments.add(childSegment);
+                
+                // 移动到下一个子片段（考虑重叠）
+                start += (CHILD_SEGMENT_SIZE - overlap);
+                childIndex++;
+            }
+            
+            parentIndex++;
+            
+            if (parentIndex % 50 == 0) {
+                log.info("已处理 {}/{} 个父片段", parentIndex, tempParentSegments.size());
+            }
+        }
+        
+        log.info("Parent-Child 片段创建完成：{} 个父片段，{} 个子片段", 
+                parentSegments.size(), childSegments.size());
+    }
+    
+    /**
+     * 根据子片段获取对应的父片段
+     * 
+     * @param childSegment 子片段
+     * @return 父片段，如果找不到则返回 null
+     */
+    public TextSegment getParentSegment(TextSegment childSegment) {
+        if (childSegment == null || childSegment.metadata() == null) {
+            return null;
+        }
+        
+        String parentId = childSegment.metadata().get("parentId");
+        if (parentId == null) {
+            return null;
+        }
+        
+        return parentSegments.get(parentId);
+    }
+    
+    /**
+     * 初始化向量库，将所有子片段进行向量化并存储
      */
     private void initializeVectorStore() {
         if (vectorStoreInitialized) {
@@ -290,30 +418,31 @@ public class DocumentService {
             return;
         }
         
-        if (chunks == null || chunks.isEmpty()) {
-            log.warn("切片列表为空，无法初始化向量库");
+        if (childSegments == null || childSegments.isEmpty()) {
+            log.warn("子片段列表为空，无法初始化向量库");
             return;
         }
         
         try {
-            log.info("开始初始化向量库，切片数量: {}", chunks.size());
+            log.info("开始初始化向量库，子片段数量: {}", childSegments.size());
             
-            // 为每个切片生成嵌入向量并存储
+            // 只为子片段生成嵌入向量并存储（用于向量搜索）
             cachedEmbeddings = new ArrayList<>();
-            for (int i = 0; i < chunks.size(); i++) {
-                TextSegment segment = chunks.get(i);
+            for (int i = 0; i < childSegments.size(); i++) {
+                TextSegment segment = childSegments.get(i);
                 Embedding embedding = embeddingModel.embed(segment.text()).content();
                 vectorStore.add(embedding, segment);
                 cachedEmbeddings.add(embedding); // 缓存 embedding 以便后续保存
                 
                 if ((i + 1) % 100 == 0) {
-                    log.info("已处理 {}/{} 个切片", i + 1, chunks.size());
+                    log.info("已处理 {}/{} 个子片段", i + 1, childSegments.size());
                 }
             }
             
             vectorStoreInitialized = true;
             log.info("========== 向量库初始化完成 ==========");
-            log.info("已存储 {} 个向量", chunks.size());
+            log.info("已存储 {} 个子片段向量（用于搜索）", childSegments.size());
+            log.info("已存储 {} 个父片段（用于上下文）", parentSegments.size());
             log.info("========== ========== ==========");
             
         } catch (Exception e) {

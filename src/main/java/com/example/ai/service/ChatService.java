@@ -312,10 +312,15 @@ public class ChatService {
             
             // 步骤 4: 重排序 - 使用本地评分模型对结果进行重新排序
             log.info("开始执行重排序，从 {} 个结果中选择 TOP 5", initialResults.size());
-            List<DocumentService.SearchResult> rerankedResults = rerankResults(initialResults, userMessage, 5);
-            log.info("重排序完成，最终选择 {} 个最相关的切片", rerankedResults.size());
+            List<DocumentService.SearchResult> rerankedChildResults = rerankResults(initialResults, userMessage, 5);
+            log.info("重排序完成，最终选择 {} 个最相关的子片段", rerankedChildResults.size());
             
-            return rerankedResults;
+            // 步骤 5: Small-to-Big 策略 - 将子片段转换为父片段
+            log.info("========== 开始 Small-to-Big 转换 ==========");
+            List<DocumentService.SearchResult> parentResults = convertToParentSegments(rerankedChildResults);
+            log.info("Small-to-Big 转换完成，最终选择 {} 个父片段（完整上下文）", parentResults.size());
+            
+            return parentResults;
         }).subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic())
           .doOnError(error -> {
               log.error("文档检索失败", error);
@@ -732,6 +737,79 @@ public class ChatService {
             this.result = result;
             this.rerankScore = rerankScore;
         }
+    }
+    
+    /**
+     * 将子片段搜索结果转换为父片段搜索结果（Small-to-Big 策略）
+     * 使用子片段进行高精度搜索，但将完整的父片段发送给 LLM
+     * 
+     * @param childResults 子片段搜索结果
+     * @return 父片段搜索结果
+     */
+    private List<DocumentService.SearchResult> convertToParentSegments(
+            List<DocumentService.SearchResult> childResults) {
+        
+        if (childResults == null || childResults.isEmpty()) {
+            return List.of();
+        }
+        
+        log.info("开始将 {} 个子片段转换为父片段", childResults.size());
+        
+        // 使用 Set 去重（多个子片段可能属于同一个父片段）
+        java.util.Map<String, DocumentService.SearchResult> parentMap = new java.util.HashMap<>();
+        
+        for (DocumentService.SearchResult childResult : childResults) {
+            TextSegment childSegment = childResult.getSegment();
+            
+            // 获取对应的父片段
+            TextSegment parentSegment = documentService.getParentSegment(childSegment);
+            
+            if (parentSegment != null) {
+                String parentId = childSegment.metadata() != null 
+                        ? childSegment.metadata().get("parentId") 
+                        : null;
+                
+                if (parentId != null && !parentMap.containsKey(parentId)) {
+                    // 创建父片段搜索结果（保留子片段的得分）
+                    DocumentService.SearchResult parentResult = new DocumentService.SearchResult(
+                            parentSegment,
+                            childResult.getScore() // 保留子片段的相似度得分
+                    );
+                    parentMap.put(parentId, parentResult);
+                    log.debug("找到父片段: {} (来自子片段得分: {})", 
+                            parentId, String.format("%.4f", childResult.getScore()));
+                } else if (parentId != null) {
+                    // 如果父片段已存在，选择得分更高的子片段对应的父片段
+                    DocumentService.SearchResult existingParent = parentMap.get(parentId);
+                    if (childResult.getScore() > existingParent.getScore()) {
+                        DocumentService.SearchResult parentResult = new DocumentService.SearchResult(
+                                parentSegment,
+                                childResult.getScore()
+                        );
+                        parentMap.put(parentId, parentResult);
+                        log.debug("更新父片段: {} (更高得分: {})", 
+                                parentId, String.format("%.4f", childResult.getScore()));
+                    }
+                }
+            } else {
+                // 如果找不到父片段，使用子片段本身（向后兼容）
+                log.warn("未找到子片段对应的父片段，使用子片段本身");
+                String fallbackId = "fallback_" + childResult.hashCode();
+                if (!parentMap.containsKey(fallbackId)) {
+                    parentMap.put(fallbackId, childResult);
+                }
+            }
+        }
+        
+        List<DocumentService.SearchResult> parentResults = new ArrayList<>(parentMap.values());
+        
+        // 按得分降序排序
+        parentResults.sort((a, b) -> Double.compare(b.getScore(), a.getScore()));
+        
+        log.info("Small-to-Big 转换完成：{} 个子片段 -> {} 个父片段", 
+                childResults.size(), parentResults.size());
+        
+        return parentResults;
     }
     
     /**
