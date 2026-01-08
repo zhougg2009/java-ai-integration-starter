@@ -292,10 +292,23 @@ public class ChatService {
                 log.info("查询已经是英文，跳过翻译步骤（节省 API 成本）");
             }
             
-            // 步骤 2: 生成 HyDE (Hypothetical Document Embeddings) 假设答案
+            // 步骤 2: Step-back Prompting - 生成更高层次的概念性问题
+            String stepBackQuery = null;
+            try {
+                log.info("========== 开始 Step-back Prompting ==========");
+                log.info("原始查询: {}", searchQuery);
+                stepBackQuery = generateStepBackQuery(searchQuery);
+                log.info("========== Step-back 查询生成完成 ==========");
+                log.info("Step-back Conceptual Query: {}", stepBackQuery);
+            } catch (Exception e) {
+                log.warn("Step-back 生成失败，将只使用原始查询进行搜索: {}", e.getMessage());
+                // Step-back 生成失败时，继续使用原始查询
+            }
+            
+            // 步骤 3: 生成 HyDE (Hypothetical Document Embeddings) 假设答案（针对原始查询）
             String hydeQuery = searchQuery;
             try {
-                log.info("========== 开始生成 HyDE 假设答案 ==========");
+                log.info("========== 开始生成 HyDE 假设答案（原始查询） ==========");
                 log.info("原始查询: {}", searchQuery);
                 String hypotheticalAnswer = generateHyDEAnswer(searchQuery);
                 log.info("========== HyDE 假设答案生成完成 ==========");
@@ -306,31 +319,45 @@ public class ChatService {
                 // HyDE 生成失败时，继续使用原始查询
             }
             
-            // 步骤 3: 混合搜索 - 执行向量搜索和关键词搜索
-            int initialRetrievalSize = 20; // 增加检索数量以支持混合搜索
-            log.info("========== 开始混合搜索 ==========");
-            log.info("向量搜索查询（HyDE）: {}，初始检索数量: {}", hydeQuery, initialRetrievalSize);
+            // 步骤 4: 双重混合搜索 - 对原始查询和 Step-back 查询都执行混合搜索
+            int initialRetrievalSize = 20; // 每个查询检索 20 个结果
+            log.info("========== 开始双重混合搜索 ==========");
             
-            // 3a. 向量搜索（基于 HyDE）
-            List<DocumentService.SearchResult> vectorResults = documentService.search(hydeQuery, initialRetrievalSize);
-            log.info("向量搜索完成，找到 {} 个相关切片", vectorResults.size());
+            // 4a. 原始查询的混合搜索
+            List<DocumentService.SearchResult> originalHybridResults = performHybridSearch(
+                    searchQuery, hydeQuery, initialRetrievalSize, "原始查询");
             
-            // 3b. 关键词搜索（基于原始查询中的技术术语）
-            log.info("关键词搜索查询: {}，初始检索数量: {}", searchQuery, initialRetrievalSize);
-            List<DocumentService.SearchResult> keywordResults = documentService.keywordSearch(searchQuery, initialRetrievalSize);
-            log.info("关键词搜索完成，找到 {} 个匹配切片", keywordResults.size());
+            // 4b. Step-back 查询的混合搜索（如果生成了 Step-back 查询）
+            List<DocumentService.SearchResult> stepBackHybridResults = new ArrayList<>();
+            if (stepBackQuery != null && !stepBackQuery.trim().isEmpty()) {
+                // 为 Step-back 查询生成 HyDE
+                String stepBackHydeQuery = stepBackQuery;
+                try {
+                    log.info("========== 开始生成 HyDE 假设答案（Step-back 查询） ==========");
+                    String stepBackHypotheticalAnswer = generateHyDEAnswer(stepBackQuery);
+                    log.info("Step-back HyDE Hypothetical Answer: {}", stepBackHypotheticalAnswer);
+                    stepBackHydeQuery = stepBackHypotheticalAnswer;
+                } catch (Exception e) {
+                    log.warn("Step-back HyDE 生成失败，使用 Step-back 查询进行搜索: {}", e.getMessage());
+                }
+                
+                stepBackHybridResults = performHybridSearch(
+                        stepBackQuery, stepBackHydeQuery, initialRetrievalSize, "Step-back 查询");
+            }
             
-            // 3c. 使用 RRF (Reciprocal Rank Fusion) 合并结果
-            log.info("开始执行 RRF 合并，向量结果: {}，关键词结果: {}", vectorResults.size(), keywordResults.size());
-            List<DocumentService.SearchResult> hybridResults = performRRF(vectorResults, keywordResults, initialRetrievalSize);
-            log.info("RRF 合并完成，得到 {} 个混合搜索结果", hybridResults.size());
+            // 4c. 合并双重检索结果（去重）
+            log.info("开始合并双重检索结果，原始查询结果: {}，Step-back 查询结果: {}", 
+                    originalHybridResults.size(), stepBackHybridResults.size());
+            List<DocumentService.SearchResult> combinedResults = mergeAndDeduplicateResults(
+                    originalHybridResults, stepBackHybridResults);
+            log.info("合并完成，得到 {} 个去重后的结果", combinedResults.size());
             
-            // 步骤 4: 重排序 - 使用本地评分模型对混合搜索结果进行重新排序
-            log.info("开始执行重排序，从 {} 个混合结果中选择 TOP 5", hybridResults.size());
-            List<DocumentService.SearchResult> rerankedChildResults = rerankResults(hybridResults, userMessage, 5);
+            // 步骤 5: 重排序 - 使用本地评分模型对合并后的结果进行重新排序
+            log.info("开始执行重排序，从 {} 个合并结果中选择 TOP 5", combinedResults.size());
+            List<DocumentService.SearchResult> rerankedChildResults = rerankResults(combinedResults, userMessage, 5);
             log.info("重排序完成，最终选择 {} 个最相关的子片段", rerankedChildResults.size());
             
-            // 步骤 5: Small-to-Big 策略 - 将子片段转换为父片段
+            // 步骤 6: Small-to-Big 策略 - 将子片段转换为父片段
             log.info("========== 开始 Small-to-Big 转换 ==========");
             List<DocumentService.SearchResult> parentResults = convertToParentSegments(rerankedChildResults);
             log.info("Small-to-Big 转换完成，最终选择 {} 个父片段（完整上下文）", parentResults.size());
@@ -457,6 +484,120 @@ public class ChatService {
         
         // 如果英文字母占比超过 50%，认为是英文
         return (double) englishChars / totalChars > 0.5;
+    }
+    
+    /**
+     * 生成 Step-back 概念性问题
+     * 通过生成一个更高层次、更基础的概念性问题来增强 AI 的推理能力
+     * 
+     * @param originalQuery 原始技术问题
+     * @return Step-back 概念性问题
+     * @throws Exception 如果生成失败
+     */
+    private String generateStepBackQuery(String originalQuery) throws Exception {
+        String stepBackPrompt = String.format(
+            "Given the technical question: %s\n\n" +
+            "What is a higher-level, more fundamental conceptual question related to this? " +
+            "The conceptual question should focus on the underlying principles, design patterns, " +
+            "or core concepts from 'Effective Java' that would help answer the original question. " +
+            "Return ONLY the conceptual question, without any explanation or additional text.",
+            originalQuery
+        );
+        
+        log.debug("Step-back 提示词: {}", stepBackPrompt);
+        
+        Prompt stepBackPromptObj = new Prompt(new UserMessage(stepBackPrompt));
+        ChatResponse response = chatModel.call(stepBackPromptObj);
+        
+        String stepBackQuery = response.getResult().getOutput().getText();
+        
+        if (stepBackQuery == null || stepBackQuery.trim().isEmpty()) {
+            throw new RuntimeException("Step-back 查询生成结果为空");
+        }
+        
+        // 清理结果（移除可能的引号、多余空格等）
+        stepBackQuery = stepBackQuery.trim();
+        if (stepBackQuery.startsWith("\"") && stepBackQuery.endsWith("\"")) {
+            stepBackQuery = stepBackQuery.substring(1, stepBackQuery.length() - 1);
+        }
+        if (stepBackQuery.startsWith("'") && stepBackQuery.endsWith("'")) {
+            stepBackQuery = stepBackQuery.substring(1, stepBackQuery.length() - 1);
+        }
+        
+        return stepBackQuery.trim();
+    }
+    
+    /**
+     * 执行混合搜索（向量搜索 + 关键词搜索 + RRF 合并）
+     * 
+     * @param originalQuery 原始查询（用于关键词搜索）
+     * @param hydeQuery HyDE 假设答案（用于向量搜索）
+     * @param retrievalSize 检索数量
+     * @param queryLabel 查询标签（用于日志）
+     * @return 混合搜索结果
+     */
+    private List<DocumentService.SearchResult> performHybridSearch(
+            String originalQuery, String hydeQuery, int retrievalSize, String queryLabel) {
+        
+        log.info("开始执行混合搜索（{}），向量搜索查询（HyDE）: {}，关键词搜索查询: {}", 
+                queryLabel, hydeQuery, originalQuery);
+        
+        // 向量搜索（基于 HyDE）
+        List<DocumentService.SearchResult> vectorResults = documentService.search(hydeQuery, retrievalSize);
+        log.info("{} 向量搜索完成，找到 {} 个相关切片", queryLabel, vectorResults.size());
+        
+        // 关键词搜索（基于原始查询）
+        List<DocumentService.SearchResult> keywordResults = documentService.keywordSearch(originalQuery, retrievalSize);
+        log.info("{} 关键词搜索完成，找到 {} 个匹配切片", queryLabel, keywordResults.size());
+        
+        // 使用 RRF 合并结果
+        List<DocumentService.SearchResult> hybridResults = performRRF(vectorResults, keywordResults, retrievalSize);
+        log.info("{} RRF 合并完成，得到 {} 个混合搜索结果", queryLabel, hybridResults.size());
+        
+        return hybridResults;
+    }
+    
+    /**
+     * 合并并去重双重检索结果
+     * 使用 TextSegment 的文本内容作为去重依据
+     * 
+     * @param results1 第一组结果
+     * @param results2 第二组结果
+     * @return 合并并去重后的结果
+     */
+    private List<DocumentService.SearchResult> mergeAndDeduplicateResults(
+            List<DocumentService.SearchResult> results1,
+            List<DocumentService.SearchResult> results2) {
+        
+        // 使用 Map 去重，key 为文本内容
+        Map<String, DocumentService.SearchResult> resultMap = new HashMap<>();
+        
+        // 添加第一组结果
+        for (DocumentService.SearchResult result : results1) {
+            String text = result.getSegment().text();
+            // 如果已存在，选择得分更高的
+            if (!resultMap.containsKey(text) || result.getScore() > resultMap.get(text).getScore()) {
+                resultMap.put(text, result);
+            }
+        }
+        
+        // 添加第二组结果
+        for (DocumentService.SearchResult result : results2) {
+            String text = result.getSegment().text();
+            // 如果已存在，选择得分更高的
+            if (!resultMap.containsKey(text) || result.getScore() > resultMap.get(text).getScore()) {
+                resultMap.put(text, result);
+            }
+        }
+        
+        // 转换为列表并按得分排序
+        List<DocumentService.SearchResult> mergedResults = new ArrayList<>(resultMap.values());
+        mergedResults.sort((a, b) -> Double.compare(b.getScore(), a.getScore()));
+        
+        log.info("合并去重完成：原始 {} 个结果 + Step-back {} 个结果 -> {} 个去重结果", 
+                results1.size(), results2.size(), mergedResults.size());
+        
+        return mergedResults;
     }
     
     /**
