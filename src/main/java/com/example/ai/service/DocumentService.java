@@ -55,9 +55,15 @@ public class DocumentService {
     private Path vectorStorePath;
     private List<Embedding> cachedEmbeddings; // 缓存 embeddings 以便保存
     
-    // Parent-Child 配置
-    private static final int PARENT_SEGMENT_SIZE = 800; // 父片段大小（字符）
+    // Parent-Child 配置（语义分块）
+    private static final int PARENT_SEGMENT_MIN_SIZE = 400; // 父片段最小大小（字符）
+    private static final int PARENT_SEGMENT_MAX_SIZE = 1200; // 父片段最大大小（字符）
+    private static final int PARENT_SEGMENT_TARGET_SIZE = 800; // 父片段目标大小（字符）
     private static final int CHILD_SEGMENT_SIZE = 150; // 子片段大小（字符）
+    
+    // 语义分块配置
+    private static final double SEMANTIC_SIMILARITY_THRESHOLD = 0.7; // 语义相似度阈值（低于此值则分割）
+    private static final int MIN_SENTENCES_PER_CHUNK = 3; // 每个块的最小句子数
     
     // 结构化模式检测（用于元数据增强）
     private static final Pattern ITEM_PATTERN = Pattern.compile(
@@ -356,11 +362,12 @@ public class DocumentService {
         this.childSegments = new ArrayList<>();
         this.parentSegments = new HashMap<>();
         
-        log.info("开始创建 Parent-Child 片段结构...");
-        log.info("父片段大小: {} 字符，子片段大小: {} 字符", PARENT_SEGMENT_SIZE, CHILD_SEGMENT_SIZE);
+        log.info("开始创建 Parent-Child 片段结构（使用语义分块）...");
+        log.info("父片段大小范围: {} - {} 字符（目标: {}），子片段大小: {} 字符", 
+                PARENT_SEGMENT_MIN_SIZE, PARENT_SEGMENT_MAX_SIZE, PARENT_SEGMENT_TARGET_SIZE, CHILD_SEGMENT_SIZE);
         
-        // 首先创建父片段（大片段）
-        List<TextSegment> tempParentSegments = DocumentSplitters.recursive(PARENT_SEGMENT_SIZE, 50).split(document);
+        // 使用语义分块创建父片段（大片段）
+        List<TextSegment> tempParentSegments = performSemanticChunking(document);
         
         int parentIndex = 0;
         for (TextSegment parentSegment : tempParentSegments) {
@@ -416,6 +423,428 @@ public class DocumentService {
         
         log.info("Parent-Child 片段创建完成：{} 个父片段，{} 个子片段", 
                 parentSegments.size(), childSegments.size());
+    }
+    
+    /**
+     * 执行语义分块
+     * 使用句子级别的嵌入来找到最优分割点，确保逻辑完整性
+     * 
+     * @param document 原始文档
+     * @return 语义分块后的文本片段列表
+     */
+    private List<TextSegment> performSemanticChunking(Document document) {
+        String fullText = document.text();
+        log.info("开始语义分块，文档总长度: {} 字符", fullText.length());
+        
+        // 步骤 1: 将文本分割成句子
+        List<String> sentences = splitIntoSentences(fullText);
+        log.info("分割成 {} 个句子", sentences.size());
+        
+        if (sentences.isEmpty()) {
+            log.warn("未找到句子，使用默认分块策略");
+            return DocumentSplitters.recursive(PARENT_SEGMENT_TARGET_SIZE, 50).split(document);
+        }
+        
+        // 步骤 2: 计算每个句子的嵌入
+        log.info("开始计算句子嵌入...");
+        List<Embedding> sentenceEmbeddings = new ArrayList<>();
+        for (int i = 0; i < sentences.size(); i++) {
+            String sentence = sentences.get(i);
+            if (sentence.trim().length() > 10) { // 只处理有意义的句子
+                Embedding embedding = embeddingModel.embed(sentence).content();
+                sentenceEmbeddings.add(embedding);
+            } else {
+                sentenceEmbeddings.add(null); // 占位符
+            }
+            
+            if ((i + 1) % 100 == 0) {
+                log.info("已处理 {}/{} 个句子", i + 1, sentences.size());
+            }
+        }
+        log.info("句子嵌入计算完成");
+        
+        // 步骤 3: 计算相邻句子之间的相似度，找到语义边界
+        log.info("开始分析语义边界...");
+        List<Integer> breakpoints = findSemanticBreakpoints(sentences, sentenceEmbeddings);
+        log.info("找到 {} 个语义边界点", breakpoints.size());
+        
+        // 步骤 4: 根据语义边界创建块
+        List<TextSegment> chunks = createChunksFromBreakpoints(fullText, sentences, breakpoints);
+        log.info("语义分块完成，创建了 {} 个语义块", chunks.size());
+        
+        return chunks;
+    }
+    
+    /**
+     * 将文本分割成句子
+     * 
+     * @param text 文本内容
+     * @return 句子列表
+     */
+    private List<String> splitIntoSentences(String text) {
+        List<String> sentences = new ArrayList<>();
+        
+        // 使用正则表达式分割句子（考虑句号、问号、感叹号等）
+        // 同时考虑代码块和特殊格式
+        String[] parts = text.split("(?<=[.!?])\\s+(?=[A-Z])|(?<=[.!?])\\n+");
+        
+        for (String part : parts) {
+            part = part.trim();
+            if (!part.isEmpty() && part.length() > 10) { // 过滤太短的片段
+                sentences.add(part);
+            }
+        }
+        
+        // 如果分割结果太少，尝试更宽松的分割
+        if (sentences.size() < 10) {
+            sentences.clear();
+            parts = text.split("[.!?]\\s+");
+            for (String part : parts) {
+                part = part.trim();
+                if (!part.isEmpty() && part.length() > 10) {
+                    sentences.add(part);
+                }
+            }
+        }
+        
+        return sentences;
+    }
+    
+    /**
+     * 找到语义边界点（相邻句子相似度低的地方）
+     * 
+     * @param sentences 句子列表
+     * @param sentenceEmbeddings 句子嵌入列表
+     * @return 边界点索引列表（在这些索引之后分割）
+     */
+    private List<Integer> findSemanticBreakpoints(List<String> sentences, List<Embedding> sentenceEmbeddings) {
+        List<Integer> breakpoints = new ArrayList<>();
+        
+        // 计算相邻句子之间的余弦相似度
+        for (int i = 0; i < sentences.size() - 1; i++) {
+            Embedding emb1 = sentenceEmbeddings.get(i);
+            Embedding emb2 = sentenceEmbeddings.get(i + 1);
+            
+            if (emb1 == null || emb2 == null) {
+                continue; // 跳过无效嵌入
+            }
+            
+            // 计算余弦相似度
+            double similarity = cosineSimilarity(emb1, emb2);
+            
+            // 如果相似度低于阈值，这是一个潜在的边界点
+            if (similarity < SEMANTIC_SIMILARITY_THRESHOLD) {
+                // 检查是否满足最小块大小要求
+                int currentChunkSize = calculateChunkSize(sentences, breakpoints, i);
+                if (currentChunkSize >= PARENT_SEGMENT_MIN_SIZE || 
+                    (currentChunkSize >= 200 && similarity < SEMANTIC_SIMILARITY_THRESHOLD * 0.8)) {
+                    breakpoints.add(i);
+                }
+            }
+        }
+        
+        // 确保最后一个边界点在文档末尾
+        if (breakpoints.isEmpty() || breakpoints.get(breakpoints.size() - 1) != sentences.size() - 1) {
+            breakpoints.add(sentences.size() - 1);
+        }
+        
+        return breakpoints;
+    }
+    
+    /**
+     * 计算两个嵌入向量的余弦相似度
+     * 
+     * @param emb1 第一个嵌入向量
+     * @param emb2 第二个嵌入向量
+     * @return 余弦相似度（0-1）
+     */
+    private double cosineSimilarity(Embedding emb1, Embedding emb2) {
+        List<Float> vec1 = emb1.vectorAsList();
+        List<Float> vec2 = emb2.vectorAsList();
+        
+        if (vec1.size() != vec2.size()) {
+            return 0.0;
+        }
+        
+        double dotProduct = 0.0;
+        double norm1 = 0.0;
+        double norm2 = 0.0;
+        
+        for (int i = 0; i < vec1.size(); i++) {
+            dotProduct += vec1.get(i) * vec2.get(i);
+            norm1 += vec1.get(i) * vec1.get(i);
+            norm2 += vec2.get(i) * vec2.get(i);
+        }
+        
+        if (norm1 == 0.0 || norm2 == 0.0) {
+            return 0.0;
+        }
+        
+        return dotProduct / (Math.sqrt(norm1) * Math.sqrt(norm2));
+    }
+    
+    /**
+     * 计算当前块的字符数
+     * 
+     * @param sentences 句子列表
+     * @param breakpoints 已有的边界点
+     * @param currentIndex 当前索引
+     * @return 当前块的字符数
+     */
+    private int calculateChunkSize(List<String> sentences, List<Integer> breakpoints, int currentIndex) {
+        int startIndex = breakpoints.isEmpty() ? 0 : breakpoints.get(breakpoints.size() - 1) + 1;
+        int size = 0;
+        for (int i = startIndex; i <= currentIndex; i++) {
+            size += sentences.get(i).length();
+        }
+        return size;
+    }
+    
+    /**
+     * 根据边界点创建文本块
+     * 确保逻辑完整性，避免分割代码示例和完整的 Item
+     * 
+     * @param fullText 完整文本
+     * @param sentences 句子列表
+     * @param breakpoints 边界点列表
+     * @return 文本块列表
+     */
+    private List<TextSegment> createChunksFromBreakpoints(
+            String fullText, List<String> sentences, List<Integer> breakpoints) {
+        
+        List<TextSegment> chunks = new ArrayList<>();
+        int startIndex = 0;
+        String pendingChunk = ""; // 待合并的小块
+        
+        for (int breakpoint : breakpoints) {
+            // 收集从 startIndex 到 breakpoint 的句子
+            StringBuilder chunkText = new StringBuilder();
+            if (!pendingChunk.isEmpty()) {
+                chunkText.append(pendingChunk).append(" ");
+                pendingChunk = "";
+            }
+            
+            int sentenceCount = 0;
+            for (int i = startIndex; i <= breakpoint && i < sentences.size(); i++) {
+                String sentence = sentences.get(i);
+                chunkText.append(sentence);
+                if (i < breakpoint) {
+                    chunkText.append(" ");
+                }
+                sentenceCount++;
+            }
+            
+            String chunk = chunkText.toString().trim();
+            
+            // 检查是否包含代码块（避免在代码块中间分割）
+            if (containsCodeBlock(chunk) && chunk.length() < PARENT_SEGMENT_MAX_SIZE * 1.5) {
+                // 如果包含代码块且不是太大，保持完整
+                chunks.add(TextSegment.from(chunk));
+                startIndex = breakpoint + 1;
+                continue;
+            }
+            
+            // 确保块的大小在合理范围内
+            if (chunk.length() < PARENT_SEGMENT_MIN_SIZE && sentenceCount < MIN_SENTENCES_PER_CHUNK) {
+                // 如果块太小，暂存等待与下一个块合并
+                pendingChunk = chunk;
+                startIndex = breakpoint + 1;
+                continue;
+            }
+            
+            // 如果块太大，在语义边界处分割
+            if (chunk.length() > PARENT_SEGMENT_MAX_SIZE) {
+                // 尝试在代码块边界或段落边界处分割
+                int splitPoint = findOptimalSplitPoint(chunk);
+                
+                if (splitPoint > 0 && splitPoint < chunk.length()) {
+                    String firstPart = chunk.substring(0, splitPoint).trim();
+                    String secondPart = chunk.substring(splitPoint).trim();
+                    
+                    if (firstPart.length() >= PARENT_SEGMENT_MIN_SIZE) {
+                        chunks.add(TextSegment.from(firstPart));
+                    }
+                    // 第二部分作为待处理块
+                    pendingChunk = secondPart;
+                } else {
+                    // 如果找不到好的分割点，在中间位置强制分割
+                    int midPoint = chunk.length() / 2;
+                    int actualMidPoint = findNearestSentenceBoundary(chunk, midPoint);
+                    
+                    String firstPart = chunk.substring(0, actualMidPoint).trim();
+                    String secondPart = chunk.substring(actualMidPoint).trim();
+                    
+                    if (firstPart.length() >= PARENT_SEGMENT_MIN_SIZE) {
+                        chunks.add(TextSegment.from(firstPart));
+                    }
+                    if (secondPart.length() >= PARENT_SEGMENT_MIN_SIZE) {
+                        chunks.add(TextSegment.from(secondPart));
+                    } else {
+                        pendingChunk = secondPart;
+                    }
+                }
+            } else {
+                chunks.add(TextSegment.from(chunk));
+            }
+            
+            startIndex = breakpoint + 1;
+        }
+        
+        // 处理最后一个待合并的块
+        if (!pendingChunk.isEmpty()) {
+            if (chunks.isEmpty()) {
+                chunks.add(TextSegment.from(pendingChunk));
+            } else {
+                // 尝试合并到最后一个块
+                TextSegment lastChunk = chunks.get(chunks.size() - 1);
+                String merged = lastChunk.text() + " " + pendingChunk;
+                if (merged.length() <= PARENT_SEGMENT_MAX_SIZE) {
+                    chunks.set(chunks.size() - 1, TextSegment.from(merged));
+                } else {
+                    chunks.add(TextSegment.from(pendingChunk));
+                }
+            }
+        }
+        
+        return chunks;
+    }
+    
+    /**
+     * 检查文本是否包含代码块
+     * 
+     * @param text 文本内容
+     * @return 如果包含代码块返回 true
+     */
+    private boolean containsCodeBlock(String text) {
+        // 检查常见的代码块模式
+        return text.contains("public class") || 
+               text.contains("private ") || 
+               text.contains("public ") ||
+               text.contains("@Override") ||
+               text.contains("//") ||
+               text.contains("/*") ||
+               text.matches(".*\\{[^}]*\\}.*"); // 包含大括号
+    }
+    
+    /**
+     * 找到最优分割点（优先在代码块边界或段落边界）
+     * 
+     * @param text 文本内容
+     * @return 分割点位置
+     */
+    private int findOptimalSplitPoint(String text) {
+        int targetSize = PARENT_SEGMENT_TARGET_SIZE;
+        int searchStart = Math.max(targetSize - 200, text.length() / 3);
+        int searchEnd = Math.min(targetSize + 200, text.length() * 2 / 3);
+        
+        int bestSplitPoint = -1;
+        double bestScore = 0.0;
+        
+        // 在目标范围内查找最佳分割点
+        for (int i = searchStart; i < searchEnd && i < text.length(); i++) {
+            double score = calculateSplitPointScore(text, i);
+            if (score > bestScore) {
+                bestScore = score;
+                bestSplitPoint = i;
+            }
+        }
+        
+        // 如果找到好的分割点，返回它
+        if (bestSplitPoint > 0 && bestScore > 0.5) {
+            // 调整到最近的句子边界
+            return findNearestSentenceBoundary(text, bestSplitPoint);
+        }
+        
+        return -1; // 未找到好的分割点
+    }
+    
+    /**
+     * 计算分割点的得分（越高越好）
+     * 优先在代码块结束、段落结束、空行等处分割
+     * 
+     * @param text 文本内容
+     * @param position 分割点位置
+     * @return 得分（0-1）
+     */
+    private double calculateSplitPointScore(String text, int position) {
+        if (position <= 0 || position >= text.length()) {
+            return 0.0;
+        }
+        
+        double score = 0.0;
+        
+        // 检查是否是段落边界（双换行）
+        if (position < text.length() - 1) {
+            String around = text.substring(Math.max(0, position - 10), 
+                                          Math.min(text.length(), position + 10));
+            if (around.contains("\n\n") || around.contains("\r\n\r\n")) {
+                score += 0.4; // 段落边界得分高
+            }
+        }
+        
+        // 检查是否是代码块边界
+        if (position > 0 && position < text.length()) {
+            char before = text.charAt(position - 1);
+            char after = position < text.length() ? text.charAt(position) : ' ';
+            if (before == '}' || before == ';' || (before == '\n' && after != '{')) {
+                score += 0.3; // 代码块结束得分较高
+            }
+        }
+        
+        // 检查是否是句子边界
+        if (position > 0 && position < text.length()) {
+            char before = text.charAt(position - 1);
+            if (before == '.' || before == '!' || before == '?') {
+                score += 0.2; // 句子边界得分中等
+            }
+        }
+        
+        // 检查是否在 Item 标题之后（避免分割 Item）
+        if (position > 0) {
+            String beforeText = text.substring(Math.max(0, position - 100), position);
+            if (beforeText.matches(".*Item\\s+\\d+.*")) {
+                score -= 0.5; // 避免在 Item 标题后立即分割
+            }
+        }
+        
+        return Math.max(0.0, Math.min(1.0, score));
+    }
+    
+    /**
+     * 找到最近的句子边界（用于分割过大的块）
+     * 
+     * @param text 文本内容
+     * @param position 目标位置
+     * @return 最近的句子边界位置
+     */
+    private int findNearestSentenceBoundary(String text, int position) {
+        // 向前查找最近的句号、问号或感叹号
+        int forwardPos = position;
+        while (forwardPos < text.length() && 
+               text.charAt(forwardPos) != '.' && 
+               text.charAt(forwardPos) != '!' && 
+               text.charAt(forwardPos) != '?') {
+            forwardPos++;
+        }
+        
+        // 向后查找最近的句号、问号或感叹号
+        int backwardPos = position;
+        while (backwardPos > 0 && 
+               text.charAt(backwardPos) != '.' && 
+               text.charAt(backwardPos) != '!' && 
+               text.charAt(backwardPos) != '?') {
+            backwardPos--;
+        }
+        
+        // 选择距离目标位置更近的边界
+        int forwardDist = forwardPos - position;
+        int backwardDist = position - backwardPos;
+        
+        if (forwardPos < text.length() && (backwardPos == 0 || forwardDist < backwardDist)) {
+            return forwardPos + 1; // 包含标点符号
+        } else {
+            return backwardPos + 1; // 包含标点符号
+        }
     }
     
     /**
