@@ -371,8 +371,17 @@ public class ChatService {
 
         // 构建增强后的 Prompt 并流式响应
         Flux<String> responseStream = searchResultsMono.flatMapMany(searchResults -> {
+            // 步骤 7: Long-Context Reordering - 重排序以最大化 LLM 对关键信息的注意力
+            log.info("========== 开始 Long-Context Reordering ==========");
+            List<DocumentService.SearchResult> reorderedResults = performLongContextReordering(searchResults);
+            log.info("Long-Context Reordering 完成，重排序后的片段数: {}", reorderedResults.size());
+            
+            // 步骤 8: 上下文压缩（如果总长度超过阈值）
+            List<DocumentService.SearchResult> finalResults = performContextCompressionIfNeeded(reorderedResults);
+            log.info("上下文处理完成，最终片段数: {}", finalResults.size());
+            
             // 构建 System Prompt
-            String systemPrompt = buildSystemPrompt(searchResults);
+            String systemPrompt = buildSystemPrompt(finalResults);
             log.info("构建的 System Prompt 长度: {} 字符", systemPrompt.length());
 
             // 获取对话历史（线程安全）
@@ -1097,6 +1106,190 @@ public class ChatService {
                 childResults.size(), parentResults.size());
         
         return parentResults;
+    }
+    
+    /**
+     * 执行 Long-Context Reordering（长上下文重排序）
+     * 将最相关的片段放在开头和结尾，以最大化 LLM 的注意力
+     * 
+     * 重排序策略：
+     * - Rank 1（最相关）放在最前面
+     * - Rank 2（第二相关）放在最后面
+     * - 其余片段按顺序分布在中间
+     * 
+     * @param results 原始搜索结果列表（已按相关性排序）
+     * @return 重排序后的结果列表
+     */
+    private List<DocumentService.SearchResult> performLongContextReordering(
+            List<DocumentService.SearchResult> results) {
+        
+        if (results == null || results.isEmpty()) {
+            return results;
+        }
+        
+        if (results.size() == 1) {
+            // 只有一个结果，无需重排序
+            return results;
+        }
+        
+        log.info("开始 Long-Context Reordering，原始结果数: {}", results.size());
+        
+        List<DocumentService.SearchResult> reordered = new ArrayList<>();
+        
+        // Rank 1 放在最前面
+        reordered.add(results.get(0));
+        log.debug("Rank 1 片段放在最前面");
+        
+        if (results.size() == 2) {
+            // 只有两个结果，Rank 2 放在最后
+            reordered.add(results.get(1));
+            log.debug("Rank 2 片段放在最后");
+        } else {
+            // 三个或更多结果
+            // Rank 2 放在最后
+            reordered.add(results.get(1));
+            log.debug("Rank 2 片段放在最后");
+            
+            // 其余片段按顺序放在中间（Rank 3, 4, 5...）
+            for (int i = 2; i < results.size(); i++) {
+                // 插入到倒数第二个位置（Rank 2 之前）
+                reordered.add(reordered.size() - 1, results.get(i));
+                log.debug("Rank {} 片段插入到中间位置", i + 1);
+            }
+        }
+        
+        log.info("Long-Context Reordering 完成：Rank 1 在开头，Rank 2 在结尾，其余在中间");
+        
+        return reordered;
+    }
+    
+    /**
+     * 执行上下文压缩（如果总长度超过阈值）
+     * 使用更快的模型总结不太相关的块
+     * 
+     * @param results 搜索结果列表
+     * @return 压缩后的结果列表
+     */
+    private List<DocumentService.SearchResult> performContextCompressionIfNeeded(
+            List<DocumentService.SearchResult> results) {
+        
+        if (results == null || results.isEmpty()) {
+            return results;
+        }
+        
+        // 计算总上下文长度
+        int totalLength = results.stream()
+                .mapToInt(r -> r.getSegment().text().length())
+                .sum();
+        
+        // 上下文压缩阈值（字符数）
+        final int COMPRESSION_THRESHOLD = 8000; // 如果总长度超过 8000 字符，进行压缩
+        
+        log.info("总上下文长度: {} 字符，压缩阈值: {} 字符", totalLength, COMPRESSION_THRESHOLD);
+        
+        if (totalLength <= COMPRESSION_THRESHOLD) {
+            log.info("上下文长度未超过阈值，跳过压缩");
+            return results;
+        }
+        
+        log.info("========== 开始上下文压缩 ==========");
+        log.info("上下文长度超过阈值，将对不太相关的片段进行压缩");
+        
+        // 保留前 2 个最相关的片段（Rank 1 和 Rank 2）不压缩
+        List<DocumentService.SearchResult> compressedResults = new ArrayList<>();
+        
+        if (results.size() >= 1) {
+            // Rank 1 不压缩
+            compressedResults.add(results.get(0));
+            log.info("保留 Rank 1 片段（不压缩）");
+        }
+        
+        // 压缩中间和后面的片段（Rank 3 及以后）
+        if (results.size() > 2) {
+            for (int i = 2; i < results.size(); i++) {
+                DocumentService.SearchResult result = results.get(i);
+                String originalText = result.getSegment().text();
+                
+                // 如果片段太长，进行压缩
+                if (originalText.length() > 1000) {
+                    try {
+                        log.info("压缩 Rank {} 片段（长度: {} 字符）", i + 1, originalText.length());
+                        String compressedText = compressChunk(originalText);
+                        
+                        // 创建压缩后的片段
+                        TextSegment compressedSegment = TextSegment.from(compressedText);
+                        // 保留原始元数据
+                        if (result.getSegment().metadata() != null) {
+                            result.getSegment().metadata().asMap().forEach((key, value) -> 
+                                compressedSegment.metadata().put(key, value));
+                        }
+                        
+                        DocumentService.SearchResult compressedResult = new DocumentService.SearchResult(
+                                compressedSegment,
+                                result.getScore() // 保留原始得分
+                        );
+                        compressedResults.add(compressedResult);
+                        
+                        log.info("压缩完成：{} 字符 -> {} 字符", 
+                                originalText.length(), compressedText.length());
+                    } catch (Exception e) {
+                        log.warn("压缩片段失败，使用原始片段: {}", e.getMessage());
+                        compressedResults.add(result);
+                    }
+                } else {
+                    // 片段不太长，直接保留
+                    compressedResults.add(result);
+                }
+            }
+        }
+        
+        // Rank 2 放在最后（不压缩）
+        if (results.size() >= 2) {
+            compressedResults.add(results.get(1));
+            log.info("保留 Rank 2 片段在最后（不压缩）");
+        }
+        
+        // 重新计算总长度
+        int compressedTotalLength = compressedResults.stream()
+                .mapToInt(r -> r.getSegment().text().length())
+                .sum();
+        
+        log.info("========== 上下文压缩完成 ==========");
+        double compressionRatio = (1.0 - (double) compressedTotalLength / totalLength) * 100;
+        log.info("压缩前总长度: {} 字符，压缩后总长度: {} 字符，压缩率: {:.2f}%", 
+                totalLength, compressedTotalLength, compressionRatio);
+        
+        return compressedResults;
+    }
+    
+    /**
+     * 压缩单个块（使用 AI 模型总结）
+     * 
+     * @param chunkText 原始块文本
+     * @return 压缩后的文本
+     * @throws Exception 如果压缩失败
+     */
+    private String compressChunk(String chunkText) throws Exception {
+        String compressionPrompt = String.format(
+            "Please provide a concise summary of the following excerpt from 'Effective Java'. " +
+            "Focus on the key points, principles, or code examples. " +
+            "Keep it brief (2-3 sentences) but preserve the essential technical information. " +
+            "Do not add any commentary, just summarize:\n\n%s",
+            chunkText.length() > 2000 ? chunkText.substring(0, 2000) + "..." : chunkText
+        );
+        
+        log.debug("压缩提示词长度: {} 字符", compressionPrompt.length());
+        
+        Prompt compressionPromptObj = new Prompt(new UserMessage(compressionPrompt));
+        ChatResponse response = chatModel.call(compressionPromptObj);
+        
+        String compressedText = response.getResult().getOutput().getText();
+        
+        if (compressedText == null || compressedText.trim().isEmpty()) {
+            throw new RuntimeException("压缩结果为空");
+        }
+        
+        return compressedText.trim();
     }
     
     /**
