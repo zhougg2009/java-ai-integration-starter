@@ -17,8 +17,10 @@ import reactor.core.publisher.Mono;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -304,15 +306,28 @@ public class ChatService {
                 // HyDE 生成失败时，继续使用原始查询
             }
             
-            // 步骤 3: 使用 HyDE 假设答案执行文档检索（检索更多结果用于重排序）
-            int initialRetrievalSize = 15; // 初始检索 15 个 chunks（使用 HyDE 后可以减少检索数量）
-            log.info("开始执行文档检索，HyDE 查询: {}，初始检索数量: {}", hydeQuery, initialRetrievalSize);
-            List<DocumentService.SearchResult> initialResults = documentService.search(hydeQuery, initialRetrievalSize);
-            log.info("初始检索完成，找到 {} 个相关切片", initialResults.size());
+            // 步骤 3: 混合搜索 - 执行向量搜索和关键词搜索
+            int initialRetrievalSize = 20; // 增加检索数量以支持混合搜索
+            log.info("========== 开始混合搜索 ==========");
+            log.info("向量搜索查询（HyDE）: {}，初始检索数量: {}", hydeQuery, initialRetrievalSize);
             
-            // 步骤 4: 重排序 - 使用本地评分模型对结果进行重新排序
-            log.info("开始执行重排序，从 {} 个结果中选择 TOP 5", initialResults.size());
-            List<DocumentService.SearchResult> rerankedChildResults = rerankResults(initialResults, userMessage, 5);
+            // 3a. 向量搜索（基于 HyDE）
+            List<DocumentService.SearchResult> vectorResults = documentService.search(hydeQuery, initialRetrievalSize);
+            log.info("向量搜索完成，找到 {} 个相关切片", vectorResults.size());
+            
+            // 3b. 关键词搜索（基于原始查询中的技术术语）
+            log.info("关键词搜索查询: {}，初始检索数量: {}", searchQuery, initialRetrievalSize);
+            List<DocumentService.SearchResult> keywordResults = documentService.keywordSearch(searchQuery, initialRetrievalSize);
+            log.info("关键词搜索完成，找到 {} 个匹配切片", keywordResults.size());
+            
+            // 3c. 使用 RRF (Reciprocal Rank Fusion) 合并结果
+            log.info("开始执行 RRF 合并，向量结果: {}，关键词结果: {}", vectorResults.size(), keywordResults.size());
+            List<DocumentService.SearchResult> hybridResults = performRRF(vectorResults, keywordResults, initialRetrievalSize);
+            log.info("RRF 合并完成，得到 {} 个混合搜索结果", hybridResults.size());
+            
+            // 步骤 4: 重排序 - 使用本地评分模型对混合搜索结果进行重新排序
+            log.info("开始执行重排序，从 {} 个混合结果中选择 TOP 5", hybridResults.size());
+            List<DocumentService.SearchResult> rerankedChildResults = rerankResults(hybridResults, userMessage, 5);
             log.info("重排序完成，最终选择 {} 个最相关的子片段", rerankedChildResults.size());
             
             // 步骤 5: Small-to-Big 策略 - 将子片段转换为父片段
@@ -599,6 +614,88 @@ public class ChatService {
         return String.format("切片 %d", index);
     }
 
+    /**
+     * 执行 RRF (Reciprocal Rank Fusion) 算法合并向量搜索和关键词搜索结果
+     * RRF 公式：Score = sum(1 / (k + rank_i))，其中 k 是常数（通常为 60）
+     * 
+     * @param vectorResults 向量搜索结果
+     * @param keywordResults 关键词搜索结果
+     * @param topK 返回的合并结果数量
+     * @return 合并后的搜索结果，按 RRF 得分降序排列
+     */
+    private List<DocumentService.SearchResult> performRRF(
+            List<DocumentService.SearchResult> vectorResults,
+            List<DocumentService.SearchResult> keywordResults,
+            int topK) {
+        
+        final int RRF_K = 60; // RRF 常数
+        
+        // 创建映射：segment -> RRF score
+        Map<TextSegment, Double> rrfScores = new HashMap<>();
+        Map<TextSegment, DocumentService.SearchResult> resultMap = new HashMap<>();
+        
+        // 处理向量搜索结果
+        for (int rank = 0; rank < vectorResults.size(); rank++) {
+            DocumentService.SearchResult result = vectorResults.get(rank);
+            TextSegment segment = result.getSegment();
+            
+            // RRF 得分：1 / (k + rank)，rank 从 0 开始，所以 +1
+            double rrfScore = 1.0 / (RRF_K + rank + 1);
+            
+            rrfScores.put(segment, rrfScores.getOrDefault(segment, 0.0) + rrfScore);
+            resultMap.put(segment, result);
+        }
+        
+        // 处理关键词搜索结果
+        for (int rank = 0; rank < keywordResults.size(); rank++) {
+            DocumentService.SearchResult result = keywordResults.get(rank);
+            TextSegment segment = result.getSegment();
+            
+            // RRF 得分：1 / (k + rank)
+            double rrfScore = 1.0 / (RRF_K + rank + 1);
+            
+            rrfScores.put(segment, rrfScores.getOrDefault(segment, 0.0) + rrfScore);
+            
+            // 如果该片段在向量搜索中未出现，添加到结果映射
+            if (!resultMap.containsKey(segment)) {
+                resultMap.put(segment, result);
+            }
+        }
+        
+        // 按 RRF 得分排序
+        List<Map.Entry<TextSegment, Double>> sortedEntries = rrfScores.entrySet().stream()
+                .sorted((a, b) -> Double.compare(b.getValue(), a.getValue()))
+                .limit(topK)
+                .collect(java.util.stream.Collectors.toList());
+        
+        // 构建最终结果
+        List<DocumentService.SearchResult> mergedResults = new ArrayList<>();
+        for (Map.Entry<TextSegment, Double> entry : sortedEntries) {
+            TextSegment segment = entry.getKey();
+            double rrfScore = entry.getValue();
+            
+            // 创建新的 SearchResult，使用 RRF 得分
+            DocumentService.SearchResult rrfResult = new DocumentService.SearchResult(
+                    segment,
+                    rrfScore // 使用 RRF 得分替代原始得分
+            );
+            mergedResults.add(rrfResult);
+        }
+        
+        log.info("RRF 合并完成：向量结果 {} 个，关键词结果 {} 个，合并后 {} 个", 
+                vectorResults.size(), keywordResults.size(), mergedResults.size());
+        
+            if (!mergedResults.isEmpty()) {
+                double maxScore = mergedResults.get(0).getScore();
+                double minScore = mergedResults.get(mergedResults.size() - 1).getScore();
+                log.info("RRF 得分范围: {} - {}", 
+                        String.format("%.4f", minScore), 
+                        String.format("%.4f", maxScore));
+            }
+        
+        return mergedResults;
+    }
+    
     /**
      * 重排序搜索结果
      * 使用本地评分模型对检索结果进行重新排序，选择最相关的 TOP K 个结果

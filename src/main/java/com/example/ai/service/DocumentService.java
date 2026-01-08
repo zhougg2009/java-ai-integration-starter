@@ -545,6 +545,139 @@ public class DocumentService {
     }
     
     /**
+     * 执行关键词搜索（基于文本匹配）
+     * 用于混合搜索中的关键词搜索部分
+     * 
+     * @param query 搜索查询
+     * @param topK 返回的切片数量
+     * @return 搜索结果列表，按匹配度降序排列
+     */
+    public List<SearchResult> keywordSearch(String query, int topK) {
+        if (query == null || query.trim().isEmpty()) {
+            log.warn("关键词搜索查询为空");
+            return List.of();
+        }
+        
+        if (childSegments == null || childSegments.isEmpty()) {
+            log.warn("子片段列表为空，无法执行关键词搜索");
+            return List.of();
+        }
+        
+        try {
+            log.info("执行关键词搜索，查询: {}，返回数量: {}", query, topK);
+            
+            // 将查询转换为小写并分割为关键词
+            String[] queryTerms = query.toLowerCase().split("\\s+");
+            List<String> keywords = new ArrayList<>();
+            for (String term : queryTerms) {
+                // 移除标点符号
+                term = term.replaceAll("[^a-zA-Z0-9]", "");
+                if (!term.isEmpty() && term.length() > 2) { // 忽略太短的词
+                    keywords.add(term);
+                }
+            }
+            
+            if (keywords.isEmpty()) {
+                log.warn("未找到有效的关键词");
+                return List.of();
+            }
+            
+            log.debug("提取的关键词: {}", keywords);
+            
+            // 对每个子片段计算关键词匹配得分
+            List<SearchResult> results = new ArrayList<>();
+            for (TextSegment segment : childSegments) {
+                String text = segment.text().toLowerCase();
+                double score = calculateKeywordScore(text, keywords);
+                
+                if (score > 0) {
+                    results.add(new SearchResult(segment, score));
+                }
+            }
+            
+            // 按得分降序排序
+            results.sort((a, b) -> Double.compare(b.getScore(), a.getScore()));
+            
+            // 返回 topK 个结果
+            List<SearchResult> topResults = results.stream()
+                    .limit(topK)
+                    .collect(Collectors.toList());
+            
+            log.info("关键词搜索完成，找到 {} 个匹配结果", topResults.size());
+            return topResults;
+            
+        } catch (Exception e) {
+            log.error("执行关键词搜索时发生错误", e);
+            throw new RuntimeException("关键词搜索失败: " + e.getMessage(), e);
+        }
+    }
+    
+    /**
+     * 计算关键词匹配得分
+     * 使用 TF-IDF 简化版本：词频 + 位置权重
+     * 
+     * @param text 文本内容
+     * @param keywords 关键词列表
+     * @return 匹配得分
+     */
+    private double calculateKeywordScore(String text, List<String> keywords) {
+        if (text == null || text.isEmpty() || keywords == null || keywords.isEmpty()) {
+            return 0.0;
+        }
+        
+        double totalScore = 0.0;
+        int totalMatches = 0;
+        
+        for (String keyword : keywords) {
+            // 计算关键词在文本中的出现次数
+            int count = 0;
+            int index = text.indexOf(keyword);
+            int firstOccurrence = index;
+            
+            while (index >= 0) {
+                count++;
+                index = text.indexOf(keyword, index + keyword.length());
+            }
+            
+            if (count > 0) {
+                // 基础得分：词频（对数缩放）
+                double frequencyScore = Math.log1p(count);
+                
+                // 位置权重：出现在文本前面的关键词得分更高
+                double positionWeight = 1.0;
+                if (firstOccurrence < text.length() / 4) {
+                    positionWeight = 1.5; // 前25%的位置权重更高
+                } else if (firstOccurrence < text.length() / 2) {
+                    positionWeight = 1.2; // 前50%的位置权重稍高
+                }
+                
+                // 精确匹配权重：如果关键词是完整单词（不是子串），得分更高
+                double exactMatchWeight = 1.0;
+                if (firstOccurrence >= 0) {
+                    char before = firstOccurrence > 0 ? text.charAt(firstOccurrence - 1) : ' ';
+                    char after = firstOccurrence + keyword.length() < text.length() 
+                            ? text.charAt(firstOccurrence + keyword.length()) : ' ';
+                    if (!Character.isLetterOrDigit(before) && !Character.isLetterOrDigit(after)) {
+                        exactMatchWeight = 1.3; // 完整单词匹配
+                    }
+                }
+                
+                totalScore += frequencyScore * positionWeight * exactMatchWeight;
+                totalMatches++;
+            }
+        }
+        
+        // 归一化得分：考虑匹配的关键词数量和文本长度
+        if (totalMatches == 0) {
+            return 0.0;
+        }
+        
+        // 归一化到 0-1 范围
+        double normalizedScore = totalScore / (keywords.size() * 2.0);
+        return Math.min(1.0, normalizedScore);
+    }
+    
+    /**
      * 执行语义搜索，返回指定数量的最相关切片
      * 
      * @param query 搜索查询
