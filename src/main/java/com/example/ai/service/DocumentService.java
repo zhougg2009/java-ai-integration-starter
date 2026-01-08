@@ -27,6 +27,8 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -56,6 +58,20 @@ public class DocumentService {
     // Parent-Child 配置
     private static final int PARENT_SEGMENT_SIZE = 800; // 父片段大小（字符）
     private static final int CHILD_SEGMENT_SIZE = 150; // 子片段大小（字符）
+    
+    // 结构化模式检测（用于元数据增强）
+    private static final Pattern ITEM_PATTERN = Pattern.compile(
+        "(?i)\\b(Item\\s+\\d+[:\\.]?|条目\\s*\\d+[：。]?)", 
+        Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern CHAPTER_PATTERN = Pattern.compile(
+        "(?i)\\b(Chapter\\s+\\d+[:\\.]?|第\\s*\\d+\\s*章[：。]?)", 
+        Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern SECTION_PATTERN = Pattern.compile(
+        "(?i)\\b(Section\\s+\\d+[:\\.]?|节\\s*\\d+[：。]?)", 
+        Pattern.CASE_INSENSITIVE
+    );
 
     public DocumentService() {
         // 初始化本地嵌入模型（不消耗 API 费用）
@@ -351,8 +367,18 @@ public class DocumentService {
             String parentId = "parent_" + parentIndex;
             String parentText = parentSegment.text();
             
+            // 检测并提取结构化元数据（Item, Chapter, Section）
+            Map<String, String> metadata = extractStructuralMetadata(parentText);
+            
+            // 创建带元数据的父片段
+            TextSegment enrichedParentSegment = TextSegment.from(parentText);
+            enrichedParentSegment.metadata().put("parentId", parentId);
+            enrichedParentSegment.metadata().put("parentIndex", String.valueOf(parentIndex));
+            // 添加结构化元数据
+            metadata.forEach((key, value) -> enrichedParentSegment.metadata().put(key, value));
+            
             // 存储父片段
-            parentSegments.put(parentId, parentSegment);
+            parentSegments.put(parentId, enrichedParentSegment);
             
             // 从父片段中创建子片段（小片段，用于向量搜索）
             int parentLength = parentText.length();
@@ -366,11 +392,13 @@ public class DocumentService {
                 int end = Math.min(start + CHILD_SEGMENT_SIZE, parentLength);
                 String childText = parentText.substring(start, end);
                 
-                // 创建子片段，并在元数据中存储父片段 ID
+                // 创建子片段，并在元数据中存储父片段 ID 和结构化元数据
                 TextSegment childSegment = TextSegment.from(childText);
                 childSegment.metadata().put("parentId", parentId);
                 childSegment.metadata().put("parentIndex", String.valueOf(parentIndex));
                 childSegment.metadata().put("childIndex", String.valueOf(childIndex));
+                // 子片段继承父片段的结构化元数据
+                metadata.forEach((key, value) -> childSegment.metadata().put(key, value));
                 
                 childSegments.add(childSegment);
                 
@@ -388,6 +416,55 @@ public class DocumentService {
         
         log.info("Parent-Child 片段创建完成：{} 个父片段，{} 个子片段", 
                 parentSegments.size(), childSegments.size());
+    }
+    
+    /**
+     * 提取结构化元数据（Item, Chapter, Section 等）
+     * 
+     * @param text 文本内容
+     * @return 元数据映射
+     */
+    private Map<String, String> extractStructuralMetadata(String text) {
+        Map<String, String> metadata = new HashMap<>();
+        
+        // 检测 Item（如 "Item 1:", "Item 2:" 等）
+        Matcher itemMatcher = ITEM_PATTERN.matcher(text);
+        if (itemMatcher.find()) {
+            String itemMatch = itemMatcher.group(1);
+            // 提取数字
+            Pattern numberPattern = Pattern.compile("\\d+");
+            Matcher numberMatcher = numberPattern.matcher(itemMatch);
+            if (numberMatcher.find()) {
+                metadata.put("item_id", numberMatcher.group());
+                metadata.put("item_label", "Item " + numberMatcher.group());
+            }
+        }
+        
+        // 检测 Chapter（如 "Chapter 1:", "Chapter 2:" 等）
+        Matcher chapterMatcher = CHAPTER_PATTERN.matcher(text);
+        if (chapterMatcher.find()) {
+            String chapterMatch = chapterMatcher.group(1);
+            Pattern numberPattern = Pattern.compile("\\d+");
+            Matcher numberMatcher = numberPattern.matcher(chapterMatch);
+            if (numberMatcher.find()) {
+                metadata.put("chapter_id", numberMatcher.group());
+                metadata.put("chapter_label", "Chapter " + numberMatcher.group());
+            }
+        }
+        
+        // 检测 Section（如 "Section 1:", "Section 2:" 等）
+        Matcher sectionMatcher = SECTION_PATTERN.matcher(text);
+        if (sectionMatcher.find()) {
+            String sectionMatch = sectionMatcher.group(1);
+            Pattern numberPattern = Pattern.compile("\\d+");
+            Matcher numberMatcher = numberPattern.matcher(sectionMatch);
+            if (numberMatcher.find()) {
+                metadata.put("section_id", numberMatcher.group());
+                metadata.put("section_label", "Section " + numberMatcher.group());
+            }
+        }
+        
+        return metadata;
     }
     
     /**

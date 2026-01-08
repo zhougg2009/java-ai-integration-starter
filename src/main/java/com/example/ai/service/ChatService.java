@@ -533,6 +533,8 @@ public class ChatService {
         promptBuilder.append("你是一个基于《Effective Java》的专业助手。");
         promptBuilder.append("请根据以下提供的【参考资料】回答用户问题。");
         promptBuilder.append("如果资料中没有相关信息，请诚实说明。");
+        promptBuilder.append("\n\n重要提示：在回答时，请明确提及你引用的 Item 编号或 Chapter 编号（如果参考资料中提供了这些信息）。");
+        promptBuilder.append("这会让你的回答更加可追溯和权威。");
         promptBuilder.append("\n\n参考资料如下：\n\n");
 
         if (searchResults == null || searchResults.isEmpty()) {
@@ -541,13 +543,60 @@ public class ChatService {
             for (int i = 0; i < searchResults.size(); i++) {
                 DocumentService.SearchResult result = searchResults.get(i);
                 TextSegment segment = result.getSegment();
-                promptBuilder.append(String.format("[切片 %d]\n", i + 1));
+                
+                // 构建源标识（包含元数据信息）
+                String sourceLabel = buildSourceLabel(segment, i + 1);
+                
+                promptBuilder.append(String.format("[%s]\n", sourceLabel));
                 promptBuilder.append(segment.text());
                 promptBuilder.append("\n\n");
             }
         }
 
         return promptBuilder.toString();
+    }
+    
+    /**
+     * 构建源标签，包含元数据信息（Item ID, Chapter ID 等）
+     * 
+     * @param segment 文本片段
+     * @param index 索引
+     * @return 源标签字符串
+     */
+    private String buildSourceLabel(TextSegment segment, int index) {
+        if (segment.metadata() == null || segment.metadata().asMap().isEmpty()) {
+            return String.format("切片 %d", index);
+        }
+        
+        StringBuilder label = new StringBuilder();
+        label.append("Source ").append(index);
+        
+        // 优先显示 Item ID（最常见）
+        String itemId = segment.metadata().get("item_id");
+        String itemLabel = segment.metadata().get("item_label");
+        if (itemId != null && itemLabel != null) {
+            label.append(": ").append(itemLabel);
+            return label.toString();
+        }
+        
+        // 其次显示 Chapter ID
+        String chapterId = segment.metadata().get("chapter_id");
+        String chapterLabel = segment.metadata().get("chapter_label");
+        if (chapterId != null && chapterLabel != null) {
+            label.append(": ").append(chapterLabel);
+            return label.toString();
+        }
+        
+        // 最后显示 Section ID
+        String sectionId = segment.metadata().get("section_id");
+        String sectionLabel = segment.metadata().get("section_label");
+        if (sectionId != null && sectionLabel != null) {
+            label.append(": ").append(sectionLabel);
+            return label.toString();
+        }
+        
+        // 如果没有结构化元数据，返回默认标签
+        return String.format("切片 %d", index);
     }
 
     /**

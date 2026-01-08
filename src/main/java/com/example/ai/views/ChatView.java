@@ -302,23 +302,70 @@ public class ChatView extends VerticalLayout {
             sourceItem.addClassName(LumoUtility.Background.CONTRAST_10);
             sourceItem.addClassName(LumoUtility.BorderRadius.SMALL);
             
-            Span sourceNumber = new Span(String.format("%d. ", i + 1));
-            sourceNumber.addClassName(LumoUtility.FontWeight.BOLD);
+            // 构建源标识（包含元数据信息）
+            String sourceLabel = buildSourceLabel(segment, i + 1);
+            
+            Span sourceLabelSpan = new Span(sourceLabel);
+            sourceLabelSpan.addClassName(LumoUtility.FontWeight.BOLD);
+            sourceLabelSpan.addClassName(LumoUtility.FontSize.SMALL);
+            sourceLabelSpan.addClassName(LumoUtility.TextColor.PRIMARY);
+            sourceLabelSpan.addClassName(LumoUtility.Margin.Bottom.XSMALL);
             
             Span sourceText = new Span(preview);
             sourceText.addClassName(LumoUtility.FontSize.SMALL);
+            sourceText.getStyle().set("display", "block");
+            sourceText.getStyle().set("margin-top", "4px");
             
             Span sourceScore = new Span(String.format(" (相似度: %.4f)", result.getScore()));
             sourceScore.addClassName(LumoUtility.TextColor.SECONDARY);
             sourceScore.addClassName(LumoUtility.FontSize.SMALL);
+            sourceScore.getStyle().set("display", "block");
+            sourceScore.getStyle().set("margin-top", "4px");
             
-            sourceItem.add(sourceNumber, sourceText, sourceScore);
+            sourceItem.add(sourceLabelSpan, sourceText, sourceScore);
             sourcesContent.add(sourceItem);
         }
         
         // 使用 add 方法添加内容（Details 的新 API）
         details.add(sourcesContent);
         return details;
+    }
+    
+    /**
+     * 构建源标签，包含元数据信息（Item ID, Chapter ID 等）
+     * 
+     * @param segment 文本片段
+     * @param index 索引
+     * @return 源标签字符串
+     */
+    private String buildSourceLabel(dev.langchain4j.data.segment.TextSegment segment, int index) {
+        if (segment.metadata() == null || segment.metadata().asMap().isEmpty()) {
+            return String.format("Source %d", index);
+        }
+        
+        // 优先显示 Item ID（最常见）
+        String itemId = segment.metadata().get("item_id");
+        String itemLabel = segment.metadata().get("item_label");
+        if (itemId != null && itemLabel != null) {
+            return String.format("Source %d: %s", index, itemLabel);
+        }
+        
+        // 其次显示 Chapter ID
+        String chapterId = segment.metadata().get("chapter_id");
+        String chapterLabel = segment.metadata().get("chapter_label");
+        if (chapterId != null && chapterLabel != null) {
+            return String.format("Source %d: %s", index, chapterLabel);
+        }
+        
+        // 最后显示 Section ID
+        String sectionId = segment.metadata().get("section_id");
+        String sectionLabel = segment.metadata().get("section_label");
+        if (sectionId != null && sectionLabel != null) {
+            return String.format("Source %d: %s", index, sectionLabel);
+        }
+        
+        // 如果没有结构化元数据，返回默认标签
+        return String.format("Source %d", index);
     }
 
     /**
