@@ -1,5 +1,6 @@
 package com.example.ai.service;
 
+import com.example.ai.config.RagProperties;
 import dev.langchain4j.data.segment.TextSegment;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -26,6 +27,7 @@ import java.util.concurrent.atomic.AtomicReference;
 /**
  * 聊天服务类 - 封装所有 Spring AI 相关逻辑
  * 该服务负责处理与 AI 模型的交互，保持与 UI 层的解耦
+ * 支持功能开关（Feature Toggles）用于消融研究
  */
 @Service
 public class ChatService {
@@ -35,15 +37,18 @@ public class ChatService {
     
     private final ChatModel chatModel;
     private final DocumentService documentService;
+    private final RagProperties ragProperties;
     private final List<Message> chatMemory;
     private final Object memoryLock = new Object();
 
-    public ChatService(ChatModel chatModel, DocumentService documentService) {
+    public ChatService(ChatModel chatModel, DocumentService documentService, RagProperties ragProperties) {
         this.chatModel = chatModel;
         this.documentService = documentService;
+        this.ragProperties = ragProperties;
         // 初始化对话记忆，使用线程安全的 LinkedList，容量设为 10 条消息
         this.chatMemory = Collections.synchronizedList(new LinkedList<>());
         log.info("已初始化对话记忆，容量: {} 条消息", MEMORY_CAPACITY);
+        log.info("RAG 功能开关配置: {}", ragProperties);
     }
 
     /**
@@ -292,57 +297,78 @@ public class ChatService {
                 log.info("查询已经是英文，跳过翻译步骤（节省 API 成本）");
             }
             
-            // 步骤 2: Step-back Prompting - 生成更高层次的概念性问题
+            // 步骤 2: Step-back Prompting - 生成更高层次的概念性问题（功能开关控制）
             String stepBackQuery = null;
-            try {
-                log.info("========== 开始 Step-back Prompting ==========");
-                log.info("原始查询: {}", searchQuery);
-                stepBackQuery = generateStepBackQuery(searchQuery);
-                log.info("========== Step-back 查询生成完成 ==========");
-                log.info("Step-back Conceptual Query: {}", stepBackQuery);
-            } catch (Exception e) {
-                log.warn("Step-back 生成失败，将只使用原始查询进行搜索: {}", e.getMessage());
-                // Step-back 生成失败时，继续使用原始查询
+            if (ragProperties.isStepbackEnabled()) {
+                try {
+                    log.info("========== 开始 Step-back Prompting ==========");
+                    log.info("原始查询: {}", searchQuery);
+                    stepBackQuery = generateStepBackQuery(searchQuery);
+                    log.info("========== Step-back 查询生成完成 ==========");
+                    log.info("Step-back Conceptual Query: {}", stepBackQuery);
+                } catch (Exception e) {
+                    log.warn("Step-back 生成失败，将只使用原始查询进行搜索: {}", e.getMessage());
+                    // Step-back 生成失败时，继续使用原始查询
+                }
+            } else {
+                log.info("========== Step-back Prompting 已禁用（功能开关） ==========");
             }
             
-            // 步骤 3: 生成 HyDE (Hypothetical Document Embeddings) 假设答案（针对原始查询）
+            // 步骤 3: 生成 HyDE (Hypothetical Document Embeddings) 假设答案（针对原始查询）（功能开关控制）
             String hydeQuery = searchQuery;
-            try {
-                log.info("========== 开始生成 HyDE 假设答案（原始查询） ==========");
-                log.info("原始查询: {}", searchQuery);
-                String hypotheticalAnswer = generateHyDEAnswer(searchQuery);
-                log.info("========== HyDE 假设答案生成完成 ==========");
-                log.info("HyDE Hypothetical Answer: {}", hypotheticalAnswer);
-                hydeQuery = hypotheticalAnswer;
-            } catch (Exception e) {
-                log.warn("HyDE 生成失败，使用原始查询进行搜索: {}", e.getMessage());
-                // HyDE 生成失败时，继续使用原始查询
+            if (ragProperties.isHydeEnabled()) {
+                try {
+                    log.info("========== 开始生成 HyDE 假设答案（原始查询） ==========");
+                    log.info("原始查询: {}", searchQuery);
+                    String hypotheticalAnswer = generateHyDEAnswer(searchQuery);
+                    log.info("========== HyDE 假设答案生成完成 ==========");
+                    log.info("HyDE Hypothetical Answer: {}", hypotheticalAnswer);
+                    hydeQuery = hypotheticalAnswer;
+                } catch (Exception e) {
+                    log.warn("HyDE 生成失败，使用原始查询进行搜索: {}", e.getMessage());
+                    // HyDE 生成失败时，继续使用原始查询
+                }
+            } else {
+                log.info("========== HyDE 已禁用（功能开关），使用原始查询进行向量搜索 ==========");
             }
             
             // 步骤 4: 双重混合搜索 - 对原始查询和 Step-back 查询都执行混合搜索
             int initialRetrievalSize = 20; // 每个查询检索 20 个结果
             log.info("========== 开始双重混合搜索 ==========");
             
-            // 4a. 原始查询的混合搜索
-            List<DocumentService.SearchResult> originalHybridResults = performHybridSearch(
-                    searchQuery, hydeQuery, initialRetrievalSize, "原始查询");
+            // 4a. 原始查询的搜索（功能开关控制：混合搜索 vs 纯向量搜索）
+            List<DocumentService.SearchResult> originalHybridResults;
+            if (ragProperties.isHybridSearchEnabled()) {
+                originalHybridResults = performHybridSearch(
+                        searchQuery, hydeQuery, initialRetrievalSize, "原始查询");
+            } else {
+                log.info("========== Hybrid Search 已禁用（功能开关），仅使用向量搜索 ==========");
+                originalHybridResults = documentService.search(hydeQuery, initialRetrievalSize);
+            }
             
-            // 4b. Step-back 查询的混合搜索（如果生成了 Step-back 查询）
+            // 4b. Step-back 查询的搜索（如果生成了 Step-back 查询且功能开关启用）
             List<DocumentService.SearchResult> stepBackHybridResults = new ArrayList<>();
-            if (stepBackQuery != null && !stepBackQuery.trim().isEmpty()) {
-                // 为 Step-back 查询生成 HyDE
+            if (ragProperties.isStepbackEnabled() && stepBackQuery != null && !stepBackQuery.trim().isEmpty()) {
+                // 为 Step-back 查询生成 HyDE（如果 HyDE 功能启用）
                 String stepBackHydeQuery = stepBackQuery;
-                try {
-                    log.info("========== 开始生成 HyDE 假设答案（Step-back 查询） ==========");
-                    String stepBackHypotheticalAnswer = generateHyDEAnswer(stepBackQuery);
-                    log.info("Step-back HyDE Hypothetical Answer: {}", stepBackHypotheticalAnswer);
-                    stepBackHydeQuery = stepBackHypotheticalAnswer;
-                } catch (Exception e) {
-                    log.warn("Step-back HyDE 生成失败，使用 Step-back 查询进行搜索: {}", e.getMessage());
+                if (ragProperties.isHydeEnabled()) {
+                    try {
+                        log.info("========== 开始生成 HyDE 假设答案（Step-back 查询） ==========");
+                        String stepBackHypotheticalAnswer = generateHyDEAnswer(stepBackQuery);
+                        log.info("Step-back HyDE Hypothetical Answer: {}", stepBackHypotheticalAnswer);
+                        stepBackHydeQuery = stepBackHypotheticalAnswer;
+                    } catch (Exception e) {
+                        log.warn("Step-back HyDE 生成失败，使用 Step-back 查询进行搜索: {}", e.getMessage());
+                    }
                 }
                 
-                stepBackHybridResults = performHybridSearch(
-                        stepBackQuery, stepBackHydeQuery, initialRetrievalSize, "Step-back 查询");
+                // 执行 Step-back 查询的搜索（功能开关控制：混合搜索 vs 纯向量搜索）
+                if (ragProperties.isHybridSearchEnabled()) {
+                    stepBackHybridResults = performHybridSearch(
+                            stepBackQuery, stepBackHydeQuery, initialRetrievalSize, "Step-back 查询");
+                } else {
+                    stepBackHybridResults = documentService.search(stepBackHydeQuery, initialRetrievalSize);
+                }
             }
             
             // 4c. 合并双重检索结果（去重）
@@ -352,10 +378,18 @@ public class ChatService {
                     originalHybridResults, stepBackHybridResults);
             log.info("合并完成，得到 {} 个去重后的结果", combinedResults.size());
             
-            // 步骤 5: 重排序 - 使用本地评分模型对合并后的结果进行重新排序
-            log.info("开始执行重排序，从 {} 个合并结果中选择 TOP 5", combinedResults.size());
-            List<DocumentService.SearchResult> rerankedChildResults = rerankResults(combinedResults, userMessage, 5);
-            log.info("重排序完成，最终选择 {} 个最相关的子片段", rerankedChildResults.size());
+            // 步骤 5: 重排序 - 使用本地评分模型对合并后的结果进行重新排序（功能开关控制）
+            List<DocumentService.SearchResult> rerankedChildResults;
+            if (ragProperties.isRerankEnabled()) {
+                log.info("开始执行重排序，从 {} 个合并结果中选择 TOP 5", combinedResults.size());
+                rerankedChildResults = rerankResults(combinedResults, userMessage, 5);
+                log.info("重排序完成，最终选择 {} 个最相关的子片段", rerankedChildResults.size());
+            } else {
+                log.info("========== Reranking 已禁用（功能开关），直接使用合并结果的前 5 个 ==========");
+                rerankedChildResults = combinedResults.stream()
+                        .limit(5)
+                        .collect(java.util.stream.Collectors.toList());
+            }
             
             // 步骤 6: Small-to-Big 策略 - 将子片段转换为父片段
             log.info("========== 开始 Small-to-Big 转换 ==========");

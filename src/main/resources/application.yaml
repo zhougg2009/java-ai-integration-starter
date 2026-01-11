@@ -23,6 +23,22 @@ spring:
 server:
   port: 8080
 
+# RAG 功能开关配置（用于消融研究）
+rag:
+  features:
+    # HyDE (Hypothetical Document Embeddings) 功能开关
+    # 如果关闭，将直接使用原始查询进行向量搜索
+    hyde-enabled: true
+    # Step-back Prompting 功能开关
+    # 如果关闭，将只使用原始查询进行搜索
+    stepback-enabled: true
+    # Reranking 功能开关
+    # 如果关闭，将直接使用检索结果，不进行重排序
+    rerank-enabled: true
+    # Hybrid Search (向量搜索 + 关键词搜索) 功能开关
+    # 如果关闭，将只使用向量搜索
+    hybrid-search-enabled: true
+
 logging:
   level:
     # Spring AI 相关日志（只保留必要的信息）

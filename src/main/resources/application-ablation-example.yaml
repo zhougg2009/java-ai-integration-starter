@@ -1,0 +1,54 @@
+# RAG 消融研究配置示例
+# 
+# 此文件展示了如何使用功能开关进行消融研究
+# 复制此文件内容到 application.yaml 或 application-secrets.yaml 来测试不同的配置
+#
+# 消融研究场景示例：
+#
+# 1. 基线配置（所有功能关闭）
+# rag:
+#   features:
+#     hyde-enabled: false
+#     stepback-enabled: false
+#     rerank-enabled: false
+#     hybrid-search-enabled: false
+#
+# 2. 仅启用 HyDE
+# rag:
+#   features:
+#     hyde-enabled: true
+#     stepback-enabled: false
+#     rerank-enabled: false
+#     hybrid-search-enabled: false
+#
+# 3. 仅启用 Step-back
+# rag:
+#   features:
+#     hyde-enabled: false
+#     stepback-enabled: true
+#     rerank-enabled: false
+#     hybrid-search-enabled: false
+#
+# 4. 仅启用 Reranking
+# rag:
+#   features:
+#     hyde-enabled: false
+#     stepback-enabled: false
+#     rerank-enabled: true
+#     hybrid-search-enabled: false
+#
+# 5. 仅启用 Hybrid Search
+# rag:
+#   features:
+#     hyde-enabled: false
+#     stepback-enabled: false
+#     rerank-enabled: false
+#     hybrid-search-enabled: true
+#
+# 6. 完整配置（所有功能启用）
+# rag:
+#   features:
+#     hyde-enabled: true
+#     stepback-enabled: true
+#     rerank-enabled: true
+#     hybrid-search-enabled: true
